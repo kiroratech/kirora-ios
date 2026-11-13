@@ -1,0 +1,182 @@
+import Foundation
+import os.log
+
+/// The version sent in `Kirora-SDK`. Bumped on release.
+let sdkVersion = "0.1.0"
+let sdkName = "kirora-ios/\(sdkVersion)"
+
+/// A value guarded by a lock, for state shared across threads.
+final class Locked<Value>: @unchecked Sendable {
+    private var value: Value
+    private let lock = NSLock()
+
+    init(_ value: Value) {
+        self.value = value
+    }
+
+    @discardableResult
+    func withLock<Result>(_ body: (inout Value) throws -> Result) rethrows -> Result {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body(&value)
+    }
+
+    var current: Value { withLock { $0 } }
+}
+
+extension Locked where Value == Bool {
+    /// Sets the flag; true only for the first caller. For "once" and "the first answer wins".
+    func claimOnce() -> Bool {
+        withLock { claimed in
+            defer { claimed = true }
+            return !claimed
+        }
+    }
+}
+
+extension Locked {
+    /// Takes the optional value out, leaving nil.
+    func take<Wrapped>() -> Wrapped? where Value == Wrapped? {
+        withLock { value in
+            defer { value = nil }
+            return value
+        }
+    }
+}
+
+/// Doubling retry delays, as every Kirora SDK retries: from the first gap up to the most,
+/// with ±10% jitter so clients don't all retry at once, and never sooner than the server's
+/// `Retry-After`. The SDK's own delay may be waived (a manual flush, coming back online);
+/// the server's never is.
+struct Backoff: Sendable {
+    private let timing: DeliveryTiming
+    private var delay: Double
+    private var ownUntil = Date.distantPast
+    private var serverUntil = Date.distantPast
+
+    init(_ timing: DeliveryTiming) {
+        self.timing = timing
+        delay = timing.flushInterval
+    }
+
+    /// After a failure: returns when to try again.
+    @discardableResult
+    mutating func failed(_ error: Error?) -> Date {
+        let now = Date()
+        ownUntil = now.addingTimeInterval(delay * (1 - retryJitter + Double.random(in: 0..<(2 * retryJitter))))
+        let retryAfter = error?.retryAfterSeconds ?? 0
+        // Jitter only ever adds to the server's delay, so throttled clients spread out.
+        serverUntil = retryAfter > 0
+            ? now.addingTimeInterval(retryAfter * (1 + Double.random(in: 0..<retryJitter)))
+            : .distantPast
+        delay = min(delay * 2, timing.maxRetryDelay)
+        return notBefore()
+    }
+
+    mutating func succeeded() {
+        self = Backoff(timing)
+    }
+
+    /// No try before this. Waiving the SDK's own delay leaves only the server's.
+    func notBefore(waivingOwnDelay: Bool = false) -> Date {
+        waivingOwnDelay ? serverUntil : max(ownUntil, serverUntil)
+    }
+}
+
+/// Retry delays vary by this fraction.
+private let retryJitter = 0.1
+
+extension Error {
+    /// The server's `Retry-After`, in seconds, or 0.
+    var retryAfterSeconds: Double {
+        Double((self as? KiroraApiError)?.retryAfterMs ?? 0) / 1000
+    }
+}
+
+/// Logs to the unified log under `io.kirora.sdk`, at or below the app's chosen level.
+struct Log: Sendable {
+    let level: LogLevel
+    private static let osLog = OSLog(subsystem: "io.kirora.sdk", category: "Kirora")
+
+    // Messages are built only if they'll be written: `debug` is off by default, and some
+    // are built on the app's thread.
+    func error(_ message: @autoclosure () -> String, _ error: Error? = nil) {
+        write(.error, message, error)
+    }
+
+    func debug(_ message: @autoclosure () -> String) {
+        write(.debug, message, nil)
+    }
+
+    private func write(_ messageLevel: LogLevel, _ message: () -> String, _ error: Error?) {
+        guard messageLevel <= level else { return }
+        let text = error.map { "Kirora: \(message()): \($0)" } ?? "Kirora: \(message())"
+        os_log("%{public}@", log: Self.osLog, type: messageLevel == .error ? .error : .debug, text)
+    }
+}
+
+/// What a hung callback or call counts as after its time is up.
+struct TimeoutError: Error, CustomStringConvertible {
+    var description: String { "timed out" }
+}
+
+/// Runs `operation`, giving up after `seconds`. Unlike a task group, it doesn't wait for
+/// an operation that ignores cancellation: it answers at the timeout and lets it go.
+func withTimeout<Value: Sendable>(
+    seconds: Double,
+    _ operation: @escaping @Sendable () async throws -> Value
+) async throws -> Value {
+    try await withCheckedThrowingContinuation { continuation in
+        let answered = Locked(false)
+        let answer: @Sendable (Result<Value, Error>) -> Bool = { result in
+            let first = answered.claimOnce()
+            if first { continuation.resume(with: result) }
+            return first
+        }
+        let timer = Locked<Task<Void, Never>?>(nil)
+        let work = Task {
+            let result: Result<Value, Error>
+            do { result = .success(try await operation()) } catch { result = .failure(error) }
+            // Answered in time: the timer has nothing left to do.
+            if answer(result) { timer.take()?.cancel() }
+        }
+        timer.withLock { stored in
+            stored = Task {
+                await sleep(seconds: seconds)
+                if answer(.failure(TimeoutError())) { work.cancel() }
+            }
+        }
+    }
+}
+
+/// The longest the SDK ever waits in one go: a week. A longer wait, such as an absurd
+/// `Retry-After`, is cut to it; a retry is then tried, and refused again if still too early.
+let maxWaitSeconds: Double = 7 * 24 * 60 * 60
+
+/// Sleeps for `seconds`, whatever the value: negative or NaN is no wait, and anything past
+/// ``maxWaitSeconds`` (infinity included) is cut to it, so converting it never traps.
+func sleep(seconds: Double) async {
+    let wait = seconds.isNaN ? 0 : min(max(seconds, 0), maxWaitSeconds)
+    try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+}
+
+/// ISO 8601 with milliseconds, in UTC, as Kirora's API takes times.
+func isoTimestamp(_ date: Date) -> String {
+    isoFormatter.withLock { $0.string(from: date) }
+}
+
+func parseIsoTimestamp(_ value: String) -> Date? {
+    isoFormatter.withLock { $0.date(from: value) }
+}
+
+private let isoFormatter: Locked<ISO8601DateFormatter> = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return Locked(formatter)
+}()
+
+/// Milliseconds since 1970, as stored timestamps are kept.
+func epochMs(_ date: Date) -> Int64 { Int64((date.timeIntervalSince1970 * 1000).rounded()) }
+
+/// The lowercase UUID string the web SDK uses too, so ids look alike across platforms.
+func newId() -> String { UUID().uuidString.lowercased() }
