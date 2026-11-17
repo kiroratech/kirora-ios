@@ -1,549 +1,440 @@
 # Kirora iOS SDK
 
-The Kirora SDK for iOS. Track what your signed-in users do, record their consent, and
-register their devices to receive push notifications from Kirora.
+Connect customer activity in your iOS app to Kirora. Track events for signed-in users, automate follow-ups and register devices for push notifications.
 
-- Swift Package, zero dependencies, iOS 13 and later
-- Batches events and retries failed requests, with a bounded offline queue kept on disk
-- Push without app-delegate code: the APNs token and taps are picked up automatically
-- Delivery reports and images from a three-line Notification Service Extension
+The SDK provides a bounded offline event queue, session tracking, separate consent controls and an optional notification service extension for delivery reports and images. It has no third-party package dependencies. FirebaseMessaging is optional and supplied by your app when you send through Firebase.
 
-[Quickstart](#quickstart) · [Usage](#usage) · [Push notifications](#push-notifications) ·
-[API](#api) · [Privacy](#privacy) · [Troubleshooting](#troubleshooting)
+[Quickstart](#quickstart) · [Events and sessions](#events-and-sessions) · [Consent](#consent) · [Push notifications](#push-notifications) · [API reference](#api-reference) · [Troubleshooting](#troubleshooting)
 
 ## Installation
 
-In Xcode, choose **File → Add Package Dependencies…** and enter:
+The package declares Swift tools 5.9 and supports iOS 13+, Mac Catalyst 14+ and macOS 10.15+. Automatic app lifecycle and push integration require UIKit. A macOS build does not verify an iOS integration.
 
-```
+In Xcode, choose **File → Add Package Dependencies** and enter:
+
+```text
 https://github.com/kiroratech/kirora-ios
 ```
 
-Choose products by target:
+Choose a release tag available in the repository and add products to the appropriate targets:
 
-| Product | Add to | Purpose |
+| Product | Target | Purpose |
 | --- | --- | --- |
-| `Kirora` | App target | Events, identity, consent, sessions and push registration/taps |
-| `KiroraNotificationService` | Notification Service Extension target | Push delivery reports and images; independent of `Kirora` |
+| `Kirora` | Your app | Identity, events, sessions, consent and push registration/taps |
+| `KiroraNotificationService` | Your Notification Service Extension | Delivery reports and image attachments; independent of `Kirora` |
 
-The package declares Swift tools 5.9 and supports iOS 13+. The core also builds on macOS
-10.15+; automatic app lifecycle and push registration require UIKit. The package declares
-Mac Catalyst 14+ support. These build targets do not replace testing on an iOS device.
-
-Or in `Package.swift`:
+For a source checkout, add the local package in Xcode, or use a local SwiftPM dependency:
 
 ```swift
-dependencies: [
-    .package(url: "https://github.com/kiroratech/kirora-ios", from: "0.1.0"),
-],
-targets: [
-    .target(name: "MyApp", dependencies: [.product(name: "Kirora", package: "kirora-ios")]),
-]
+.package(path: "../kirora-ios")
 ```
+
+Add `.product(name: "Kirora", package: "kirora-ios")` to your app target's dependencies. Add `KiroraNotificationService` only to the extension target.
+
+### CocoaPods
+
+Both products have podspecs. For a local checkout:
+
+```ruby
+target 'MyApp' do
+  pod 'Kirora', :path => '../kirora-ios'
+end
+
+target 'NotificationService' do
+  pod 'KiroraNotificationService', :path => '../kirora-ios'
+end
+```
+
+Use the distribution and version documented by your release when installing remotely. A podspec in this repository does not establish that its version is published to the CocoaPods registry.
+
+For React Native or Flutter, use the corresponding Kirora wrapper. Native bridge maintainers should read [Wrapper SDKs](docs/wrappers.md).
 
 ## Quickstart
 
-### 1. Get your keys
+### 1. Get your workspace credentials
 
-In the Kirora dashboard, go to **Developer → SDK**:
+Open **Developer → SDK** in Kirora:
 
-- The **client key** (`kirora_pk_…`) is public and ships in your app.
-- The **token secret** is private. Keep it on your server only, never in the app.
+- **Client key** (`kirora_pk_…`): public; include it in your app.
+- **Token secret**: private; keep it on your server.
 
-### 2. Add a token route to your server
+Never include the token secret or a server API key in the app, notification extension, source-controlled configuration or logs.
 
-The SDK sends events as the user named in a signed token. Your server must derive that
-user from your app's authenticated session, never from an id the app sends.
+### 2. Return a user token from your server
 
-Sign an HS256 JWT with the token secret: `sub` is your app's user id as a string, `iat`
-the current Unix time in seconds, and `exp` at most 24 hours later (one hour is a good
-start). Return it as plain text with `Cache-Control: no-store`, and `401` when signed out.
-With Node.js, `@kirora/node` does it for you:
+Create an authenticated endpoint that signs a token for the current session user. Derive the user ID from your server's authenticated session, rather than accepting a user ID supplied by the app.
+
+A token is an HS256 JWT signed with the workspace's SDK token secret. It needs a string `sub`, an `iat` timestamp and an `exp` no more than 24 hours after `iat`. A one-hour lifetime is a useful starting point.
+
+With the Kirora Node.js library:
 
 ```ts
 import { createUserToken } from '@kirora/node';
 
 app.get('/kirora-token', requireSignedIn, (req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.type('text/plain').send(createUserToken(process.env.KIRORA_SDK_TOKEN_SECRET!, String(req.user.id)));
+  res.type('text/plain').send(
+    createUserToken(process.env.KIRORA_SDK_TOKEN_SECRET!, String(req.user.id)),
+  );
 });
 ```
 
-### 3. Create the client
+`requireSignedIn` and `req.user` represent your app's authentication middleware. Return `401` when there is no authenticated user.
 
-Create and retain one client for the whole app. For automatic push integration, initialize
-it on the main thread before `application(_:didFinishLaunchingWithOptions:)` returns.
-For example, keep it as an app delegate property:
+### 3. Retain one client and initialise it at launch
+
+Use one client for the app's workspace. For automatic push handling, initialise it on the main thread before the app delegate's launch method returns.
 
 ```swift
 import Kirora
 import UIKit
 
-final class AppDelegate: UIResponder, UIApplicationDelegate {
-    let kirora = Kirora(options: KiroraOptions(
-        clientKey: "kirora_pk_…",
-        fetchUserToken: { try await MyAPI.kiroraToken() }
-    ))
-}
-```
-
-`MyAPI.kiroraToken()` represents your app's authenticated request to the token route.
-It must return the plain-text token and throw for non-success HTTP responses, empty
-responses, and network errors. Send your app's session credentials only to your own
-server. The SDK supplies the Kirora headers when it sends events.
-
-With the SwiftUI app lifecycle (iOS 14+), keep the client on your `App`:
-
-```swift
-import Kirora
-import SwiftUI
-
-@main
-struct MyApp: App {
+enum AppServices {
     static let kirora = Kirora(options: KiroraOptions(
         clientKey: "kirora_pk_…",
-        fetchUserToken: { try await MyAPI.kiroraToken() }
+        fetchUserToken: { try await MyAPI.kiroraToken() },
+        requireTrackingConsent: true
     ))
-
-    init() { _ = Self.kirora }
-
-    var body: some Scene { WindowGroup { ContentView() } }
 }
-```
 
-Creating the client never throws, waits for a network response or reads the disk: the
-SDK's files are read in the background. A call made in the first moments that needs a
-stored value (such as tracking consent) waits for that read: a file of a few hundred bytes.
-
-### 4. Identify and send your first event
-
-Once your app has restored its authenticated session, use the retained client:
-
-```swift
-Task {
-    do {
-        try await kirora.identify()
-        kirora.track("Order Completed", properties: ["order_id": "1042"])
-        await kirora.flush() // Useful for verification; normal delivery is automatic.
-    } catch {
-        // Keep your app usable. Retry identify() after authentication/connectivity recovers.
-        print("Kirora identification failed: \(error)")
+final class AppDelegate: UIResponder, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+    ) -> Bool {
+        _ = AppServices.kirora
+        return true
     }
 }
 ```
 
-Here, `kirora` is the retained instance: the app delegate's `kirora` property or
-`MyApp.kirora` in the SwiftUI example. Creating a client alone does not sign the user in.
+`MyAPI.kiroraToken()` is your app's authenticated request to the endpoint above. It must return the plain-text JWT and throw on network failures, non-success responses or an empty response. Send your app's credentials only to your own server.
 
-## Usage
-
-### Identify users
-
-Call `identify()` once the user is signed in, **and at every start while they are**. Only
-then are events sent, as that user:
+For a SwiftUI app (iOS 14+), retain the same delegate with `@UIApplicationDelegateAdaptor`:
 
 ```swift
-try await kirora.identify()             // asks fetchUserToken for a token
-try await kirora.identify(token)        // or pass one you already have
+import SwiftUI
+
+@main
+struct MyApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    var body: some Scene {
+        WindowGroup { ContentView() }
+    }
+}
 ```
 
-When Kirora refuses an expired token, the SDK asks `fetchUserToken` for a fresh one and
-repeats the call once. A refreshed token must name the same user. `identify()` can throw
-`UserTokenError` if `fetchUserToken` fails, `KiroraApiError` (401) if Kirora refuses the
-token after a refresh attempt, or `KiroraError` if no token source is configured.
-With push disabled, `identify(token)` installs the token locally; validation happens
-when an authenticated request is sent, so success does not confirm server acceptance.
+Creating the client does not identify a user or make an authenticated Kirora request. It does not throw, and it never waits for its files on your thread: they're read in the background, and launch handling runs off the main thread once they are.
 
-Before your own sign-out, call `logout()`. It sends what waits, detaches the device from
-the user's pushes, and forgets the user:
+### 4. Apply the user's tracking choice
+
+The example requires opt-in. Call this from your consent flow after the user answers:
+
+```swift
+AppServices.kirora.setTrackingConsent(true) // The user granted behavioural tracking.
+```
+
+Pass `false` when the user refuses or withdraws consent. Do not automatically grant consent to make an integration check pass. If your app does not require prior opt-in, the option defaults to `false`; a remembered refusal still takes precedence.
+
+### 5. Identify and track
+
+After your app restores the authenticated session, identify the user. Repeat this at each app start while they remain signed in:
+
+```swift
+let kirora = AppServices.kirora
+
+Task {
+    do {
+        try await kirora.identify()
+        kirora.track("Order Completed", properties: [
+            "order_id": "1042",
+            "total": 46.5,
+            "currency": "USD"
+        ])
+        await kirora.flush() // Optional for verification; normal delivery is automatic.
+    } catch {
+        // Keep your app usable; retry identification after authentication/connectivity recovers.
+    }
+}
+```
+
+Check the event in Kirora. A returned `flush()` means the attempt finished, not that every event was accepted.
+
+## Identity and logout
+
+```swift
+try await kirora.identify()      // Uses fetchUserToken.
+try await kirora.identify(token) // Uses a token you already obtained.
+```
+
+The SDK sends no anonymous behavioural requests. Events tracked before identification, while tracking is allowed, wait on the device for the next user. Once adopted, they retain that user's identity across retries and restarts. Events captured while A is signed in never become B's events. If a never-accepted token is refused, its adopted pre-sign-in events can be released for a later sign-in.
+
+An authenticated request that receives `401` can refresh its token once through `fetchUserToken`. A replacement must name the same user. Tokens stay in memory; they are not written into queued events.
+
+With push disabled, `identify(token)` selects the token locally. Server acceptance is established by a subsequent authenticated request, not by that method returning alone.
+
+Call Kirora logout before clearing your app's own authentication:
 
 ```swift
 await kirora.logout()
 ```
 
-It never throws, and takes 5 seconds at most in all, a pending `identify()` included: a
-sign-in still waiting for its token when the 5 seconds run out is abandoned, so its token
-can't sign the user back in. If Kirora can't be reached, the SDK keeps trying to detach the device in the background, as it retries events (30
-seconds, doubling to 5 minutes), until someone signs in, the client is destroyed, or a day
-has passed.
+Logout attempts event delivery and device detachment within a total five-second deadline, including an identification already in progress. It then clears the selected user and their remaining behavioural events. Activity captured during logout waits for the next user.
 
-Events tracked before `identify()` wait on the device and go as the next user to sign in.
-Nothing is ever sent anonymously.
+Failed device detachment is retried in memory using the outgoing identity, with backoff, for up to 24 hours. The request names the last successful registration's `lastSeenAt`, so a late detach cannot undo a newer registration when the server implements that contract. Ensure the deployed API supports it.
 
-### Track events
+**Offline logout is not immediate server-side revocation.** Cleanup retries end when the app process ends or the client is destroyed. A request already accepted by Kirora cannot be recalled. Cleanup uses the outgoing user's token as captured and never asks `fetchUserToken` for a fresh one: a `401` ends it.
+
+## Events and sessions
 
 ```swift
-kirora.track("Order Completed", properties: [
-    "order_id": "1042",
-    "total": 46.5,
-    "currency": "USD",
-])
+kirora.track("Lesson Completed", properties: ["lesson_id": "lesson-12"])
+kirora.trackScreenView("Checkout")
 ```
 
-`track()` returns at once and never throws. Properties are copied as they are when you
-call it, and must be JSON: strings, numbers, booleans, `nil`/`NSNull`, arrays and
-dictionaries of them. Dates are sent as ISO 8601 strings, and URLs and UUIDs as strings.
-Unsupported dictionary values are left out and logged; unsupported array elements become
-JSON `null`. Non-finite numbers (`NaN` and infinity) also become `null`.
+Screens are tracked explicitly. Names are case-sensitive; use stable names that match your segments, journeys and goals. Put variable details in properties rather than event names. Names beginning with `contact.` are reserved by Kirora.
 
-### Screen views
+Properties are copied synchronously at capture. Use JSON-compatible strings, finite numbers, booleans, `NSNull`, arrays and string-keyed dictionaries. Dates become ISO 8601 strings; URLs and UUIDs become strings. An absent optional dictionary member is omitted; use `NSNull()` for an explicit null. An unsupported value drops the event and produces a diagnostic rather than throwing into your app.
 
-Screens are never tracked automatically: platforms name screens too differently. Track
-them yourself, with your own names:
+Events carry a `context` in the fields Kirora accepts: `app` (name, version, build, bundle id as `namespace`), `os` (`iOS` and its version), `screen` (portrait width and height in points, and scale as `density`), `device` (the SDK's random `id`, `manufacturer` `Apple`, `type` `ios`; no model, hardware or advertising id), an optional `sessionId`, and the device language and time zone. Kirora refuses any other context field, so a `beforeSend` that adds one gets that event dropped. Kirora records the request IP address and user agent on the server. These event/context fields follow behavioural tracking consent.
+
+### Redact before storage
+
+Use `beforeSend` to remove sensitive fields or drop an event before it enters the offline queue:
 
 ```swift
-kirora.trackScreenView("Checkout")      // tracks Screen Viewed { name: "Checkout" }
+let options = KiroraOptions(
+    clientKey: "kirora_pk_…",
+    beforeSend: { event in
+        var redacted = event
+        redacted.properties.removeValue(forKey: "email")
+        return redacted
+    }
+)
 ```
 
-In SwiftUI, `.onAppear { kirora.trackScreenView("Checkout") }`; in UIKit, a view
-controller's `viewDidAppear(_:)`.
+The synchronous hook runs once for each behavioural event, including automatic events, after context is assembled. Return `nil` to drop it. Throwing or returning values that cannot be serialised also drops it. Retry uses the redacted snapshot; it does not call the hook again. The SDK retains the original event name, timestamp, owner and idempotency key. Recursive tracking from the hook is rejected.
 
-### Sessions
+### Sessions and lifecycle events
 
-A visit begins with `Session Started` and ends after 30 minutes without activity. Each
-event carries the visit in `context.sessionId`. Time in the foreground never ends a visit,
-and a relaunch within 30 minutes continues it. Turn it off with `trackSessions: false`.
+Sessions are enabled by default. A new visit emits `Session Started`; events carry `context.sessionId`. Activity and foreground time keep the visit alive. After 30 minutes of inactivity, the next activity starts a new visit. A relaunch can continue the stored visit; changing users starts a different user's visit. Set `trackSessions: false` to disable session events and IDs.
 
-### App lifecycle
+With `trackAppLifecycle: true`, the SDK also records `Application Installed`, `Application Updated`, `Application Opened` and `Application Backgrounded`. Lifecycle tracking is off by default and subject to behavioural tracking consent.
 
-With `trackAppLifecycle: true`, the SDK tracks `Application Installed` (first launch),
-`Application Updated` (first launch of a new version), `Application Opened` (each launch
-and return to the foreground, with `from_background`) and `Application Backgrounded`.
-Installed, updated and opened events carry your app's `version` and `build`;
-`Application Backgrounded` currently has empty properties. Off by default.
+### Delivery and storage
 
-### Tracking consent
+- Delivery starts at 20 queued events, otherwise after about 30 seconds, and is attempted on backgrounding and connectivity recovery.
+- Batches hold at most 100 events and target 200,000 encoded bytes. Oversized or invalid batches are split to isolate an event the server refuses.
+- The disk queue holds at most 1,000 events and 1,000,000 encoded bytes, including ownership metadata. Oldest records are dropped when either budget is exceeded.
+- Network failures and retryable responses back off exponentially to about five minutes, with jitter. `Retry-After` is honoured; unusually large values are capped at one week.
+- Each event retains its idempotency key and capture time on retry. A batch's `sentAt` lets the API correct device-clock skew for behavioural events.
+- Accepted events and terminal refusals leave the queue. Temporary per-event refusals and missing/duplicate acknowledgements remain queued. A result that is neither Kirora's accepted nor its refused shape leaves the event queued for a retry.
+- Storage writes are asynchronous. Unavailable storage falls back to a bounded in-memory queue; recent writes can be lost on abrupt termination. Background execution and delivery are best effort.
 
-If event tracking needs opt-in, set `requireTrackingConsent: true`. Events, session ids
-and the event-tracking device id are not created until the user agrees:
+## Consent
 
-```swift
-let kirora = Kirora(options: KiroraOptions(clientKey: "kirora_pk_…", requireTrackingConsent: true))
+These controls have different purposes:
 
-// When the user answers:
-kirora.setTrackingConsent(true)
-```
+| Control | Scope | Effect |
+| --- | --- | --- |
+| `setTrackingConsent(_:)` | Device/workspace tracking preference | Controls behavioural events, sessions and influenced app-open reports |
+| `requestPushPermission()` | iOS notification authorisation | Asks the OS whether notifications may be shown |
+| `setPushEnabled(_:)` | Device/workspace preference | Enables or detaches this installation; survives logout |
+| `setPushConsent(_:)` | Signed-in user's marketing choice | Records marketing push consent with Kirora |
 
-The answer is remembered on the device. `setTrackingConsent(false)` also forgets queued
-events, the visit, and the device id unless a push registration still needs it. A retained
-id is removed by logout cleanup when the device is no longer registered.
+Withdrawing tracking clears queued behavioural events and influenced app opens, ends the session and cancels further behavioural delivery where possible. A push device ID may remain while registration or cleanup needs it. Previously accepted server data is not recalled.
 
-Tracking consent, notification permission and marketing push consent are separate
-controls. Push registration and reporting do not use the event tracking consent gate. With push
-off and consent required, nothing at all is stored before consent but the answer itself.
+Operational push registration, notification delivery receipts and taps remain separate from behavioural tracking consent. Transactional push needs OS permission; marketing push also needs the user's marketing consent. Tracking refusal does not turn notifications off or withdraw marketing push consent.
+
+The tracking choice is persisted per workspace. Refusals are stored independently in `state.json` and `consent.json`, so either refusal wins if the other copy is lost. With `requireTrackingConsent: true`, an unreadable choice blocks tracking until a fresh answer. Without it, tracking follows the fresh-install default only if the independent refusal copy can be read and contains no refusal. If neither copy can be read, tracking waits. Persistence failures are logged; the current in-memory choice still applies.
 
 ## Push notifications
 
-### Set up your app
+### Enable push
 
-1. In Xcode, add the **Push Notifications** capability to your app target.
-2. In the Kirora dashboard, add an iOS push app with your APNs key (`.p8`), key id, team
-   id and bundle id. If you already send to iOS through Firebase, give it your Firebase
-   service account instead (see [Sending through Firebase](#sending-through-firebase)).
-3. Turn push on when you create the client:
+1. Add **Push Notifications** to your app target's capabilities and use a matching provisioning profile.
+2. Configure an iOS push app and its credentials in Kirora. For APNs, provide the `.p8` key, key ID, team ID and bundle ID.
+3. Add `push: .enabled` to the retained client's options. Use `PushOptions(pushAppId: "…")` if you need to select a particular iOS push app.
+4. Identify the signed-in user, then request permission at a suitable point in your app:
 
 ```swift
-let kirora = Kirora(options: KiroraOptions(
-    clientKey: "kirora_pk_…",
-    fetchUserToken: { try await MyAPI.kiroraToken() },
-    push: .enabled
-))
+let permission = await kirora.requestPushPermission()
 ```
 
-4. Ask for permission at a moment that makes sense to the user, e.g. after they turn on
-   order updates:
+The permission result is `.granted`, `.denied`, `.unanswered` or `.unsupported`. Granted permission does not itself confirm successful Kirora registration. Query registration status separately:
 
 ```swift
-let permission = await kirora.requestPushPermission()   // .granted, .denied, .unanswered or .unsupported
+let status = await kirora.getPushStatus()
+// .enabled, .disabled, .denied, .unanswered or .unsupported
 ```
 
-That's all. The SDK registers the device with Kirora at `identify()` once the user has
-allowed notifications, and again only when the user, the APNs token or the day changes.
-If the user turns notifications off in Settings, the SDK tells Kirora the next time the
-app comes to the foreground.
+The SDK automatically observes APNs callbacks and notification taps by default. Registration is refreshed when the user or token changes, or the previous registration is a day old. Registration sends app/OS versions, language and time zone. It does not send a device model or advertising ID.
 
-Only if your workspace has more than one iOS push app, name the one to use:
-`push: PushOptions(pushAppId: "…")`.
+### Firebase
 
-### Sending through Firebase
+Kirora's push-app configuration chooses APNs or FCM tokens. For FCM, install and configure FirebaseMessaging in your app and configure its APNs credentials. Kirora reads Firebase's token at runtime without linking it as a package dependency. Do not pass an FCM token to Kirora's APNs callback.
 
-If your iOS push app in Kirora uses a Firebase service account, Kirora tells the SDK to
-register Firebase's token instead of the APNs one. Add FirebaseMessaging to your app and
-configure Firebase as usual (`FirebaseApp.configure()`, with your APNs key uploaded to
-Firebase). The SDK reads the token from FirebaseMessaging at runtime and registers again
-whenever Firebase makes a new one: it never links Firebase itself, so apps without it carry
-none of it. Pushes, taps and deliveries work the same either way.
-
-### Marketing consent
-
-The notification permission alone doesn't allow marketing pushes. Record the user's own
-answer when you ask them:
+### Device preference and marketing consent
 
 ```swift
-try await kirora.setPushConsent(true)
+await kirora.setPushEnabled(false) // Detach this device; keep the preference across users.
+await kirora.setPushEnabled(true)  // Register if OS permission is already granted; no prompt.
+
+try await kirora.setPushConsent(true) // Signed-in user's marketing choice.
 ```
 
-### Taps and links
+`setPushConsent` throws if Kirora has not recorded the choice, including when nobody is signed in. Do not show it as saved merely because your app updated its own control.
 
-The SDK reports taps on Kirora pushes and opens their link, with no code in your app:
+### Taps, foreground display and links
 
-- A web link goes to your app as a universal link: to your scene delegate's
-  `scene(_:continue:)` in a scene-based app (SwiftUI's `onContinueUserActivity` included),
-  or your app delegate's `application(_:continue:restorationHandler:)`.
-- Any other link, including an app link like `myapp://orders/1`, is opened with
-  `UIApplication.open`.
+Kirora handles only notifications carrying the top-level `kirora` marker. Test notifications without `trackingUrl` produce no reports. Taps post `opened`, or `clicked` when the tapped notification/button has a link. Dismissals are not opens.
 
-To route links yourself, set `handleDeepLink`. It's called on the main thread; return
-`true` if you opened the link, or `false` to let the SDK open it as above:
+A Kirora notification is presented in the foreground unless your own notification delegate implements `willPresent` and chooses otherwise. The automatic integration forwards notification callbacks to the app's delegate.
 
-```swift
-let kirora = Kirora(options: KiroraOptions(
-    clientKey: "kirora_pk_…",
-    push: .enabled,
-    handleDeepLink: { url in
-        guard url.host == "shop.example" else { return false }
-        Router.shared.open(url)
-        return true
-    }
-))
-```
+Use `handleDeepLink` for explicit routing. It runs on the main actor and returns `true` when your app handled the URL. Return `false` for SDK default routing. By default a web link goes to your app delegate's `application(_:continue:restorationHandler:)` and stays in the app if that returns `true`; anything else, custom schemes included, opens with `UIApplication.open` (the browser, or whichever app owns the link). A scene delegate is never handed a link, as `scene(_:continue:)` can't report whether it took it: **in a scene-based app, claim your own universal links in `handleDeepLink`**, or they open in the browser. Links using `javascript:`, `data:`, `file:` or `vbscript:` are rejected.
 
-Kirora pushes are shown while your app is open, unless your own
-`UNUserNotificationCenterDelegate` decides otherwise. Your delegate keeps working as
-before: the SDK passes every call on to it, whenever you set it.
+Button payload parsing does not create iOS action buttons. Categories/actions must be configured by the app, and the notification needs a matching category identifier. For an existing action, Kirora maps its identifier to the button index (`"0"`, `"1"`) or button title. Coordinate category assignment with your notification extension/payload; the standard Kirora sender and extension do not configure it automatically.
 
-#### Without the automatic integration
+### Manual integration
 
-The SDK picks up the APNs token by adding itself to your app delegate's callbacks, and
-taps by wrapping `UNUserNotificationCenter`'s delegate, as Firebase does. To turn that
-off, set `KiroraAppDelegateProxyEnabled` to `NO` (Boolean) in your Info.plist, and forward
-the callbacks yourself:
+To forward callbacks yourself, set `KiroraAppDelegateProxyEnabled` to Boolean `NO` in the app's Info.plist before SDK initialisation. Forward both APNs callbacks and the notification delegate callbacks:
 
 ```swift
-func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+func application(_ application: UIApplication,
+                 didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
     Kirora.application(application, didRegisterForRemoteNotificationsWithDeviceToken: deviceToken)
 }
 
-func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+func application(_ application: UIApplication,
+                 didFailToRegisterForRemoteNotificationsWithError error: Error) {
     Kirora.application(application, didFailToRegisterForRemoteNotificationsWithError: error)
 }
 
-func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                            didReceive response: UNNotificationResponse,
                             withCompletionHandler completionHandler: @escaping () -> Void) {
-    if Kirora.userNotificationCenter(center, didReceive: response, withCompletionHandler: completionHandler) { return }
-    // Not a Kirora push: handle it, then call completionHandler().
+    if Kirora.userNotificationCenter(center, didReceive: response,
+                                     withCompletionHandler: completionHandler) { return }
+    completionHandler() // Replace with your handling for other providers.
 }
 
-func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                            willPresent notification: UNNotification,
                             withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-    if Kirora.userNotificationCenter(center, willPresent: notification, withCompletionHandler: completionHandler) { return }
-    completionHandler([])
+    if Kirora.userNotificationCenter(center, willPresent: notification,
+                                     withCompletionHandler: completionHandler) { return }
+    completionHandler([]) // Replace with your presentation policy for other providers.
 }
 ```
 
+Import `UIKit`, `UserNotifications` and `Kirora` in the file containing these methods. During launch, assign your retained `UNUserNotificationCenterDelegate` to `UNUserNotificationCenter.current().delegate`. Keep that delegate strongly referenced. A returned `true` means Kirora handled the notification and called the completion handler; do not call it twice.
+
 ### Delivery reports and images
 
-iOS only lets an app see a push arrive, or show its image, from a **Notification Service
-Extension**. Without one, Kirora's reports leave iOS out of the delivered rate, and pushes
-show without images.
-
-1. In Xcode, **File → New → Target… → Notification Service Extension**.
-2. Add the **KiroraNotificationService** library to the extension target.
-3. Replace the generated `NotificationService.swift` with:
+Create a **Notification Service Extension** target and add the `KiroraNotificationService` product to that target. Replace the generated implementation with:
 
 ```swift
 import KiroraNotificationService
 
-class NotificationService: KiroraNotificationServiceExtension {}
+final class NotificationService: KiroraNotificationServiceExtension {}
 ```
 
-The extension attempts a delivery report and downloads the image before handing the
-notification to iOS. These reports are best effort: a network error, `429` or `5xx` is
-retried once, then dropped. A dashboard test push without `trackingUrl` sends no report.
-If you have your own extension already, call the helper from it instead:
+Keep the generated extension configuration and principal-class entry. Set a compatible deployment target. Kirora supplies `mutable-content: 1`; custom payloads must also satisfy Apple's notification-extension requirements.
 
-```swift
-override func didReceive(_ request: UNNotificationRequest,
-                         withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
-    if KiroraNotificationService.didReceive(request, withContentHandler: contentHandler) { return }
-    // Not a Kirora push: your own handling.
-}
+The helper attempts a delivery report and downloads an HTTPS image before finishing. It needs neither a client key nor an App Group: reporting credentials are carried by the notification's `trackingUrl`. The report retries once on network errors, `429` or `5xx`, then is dropped. Reports are best effort and are not recovered through shared App Group storage. Extension expiry hands the available content back to iOS.
 
-override func serviceExtensionTimeWillExpire() {
-    KiroraNotificationService.serviceExtensionTimeWillExpire()
-}
-```
+For an existing extension, call `KiroraNotificationService.didReceive(_:withContentHandler:)`. If it returns `false`, handle that notification yourself and call its content handler. Forward `serviceExtensionTimeWillExpire()` to Kirora too. Keep other providers' extension processing intact.
 
-The extension needs no client key and no App Group: each push carries its own reporting
-address. Keep its generated `NSExtension` configuration and principal class pointing at
-your `NotificationService` subclass, and set the extension's deployment target to match
-the app. Kirora supplies `mutable-content: 1`; custom payloads must include it to invoke
-the extension. Test images and delivery reports with the app in the background as well
-as the foreground.
+Without the extension, iOS delivered reports and Kirora image attachments are unavailable. Taps are still handled by the app.
 
-A push is Kirora's only when it says so: the top-level `kirora` marker, or a
-`trackingUrl` at Kirora's tracking path. Another provider's push that happens to use
-`actionUrl` or `imageUrl` is left to your app and its extension code. Links with
-`javascript:`, `data:`, `file:` or `vbscript:` schemes are never opened.
+## API reference
 
-## API
+### Options
 
-### `Kirora(options:)`
-
-| Option | Default | |
+| Option | Default | Purpose |
 | --- | --- | --- |
-| `clientKey` | required | The workspace's public key, `kirora_pk_…` |
-| `fetchUserToken` | `nil` | `() async throws -> String`: asks your server for a user token. Called by `identify()` without a token, and when Kirora refuses an expired one. One that hasn't answered after 30 seconds counts as failed |
-| `push` | `nil` (off) | `.enabled`, or `PushOptions(pushAppId:)` |
-| `requireTrackingConsent` | `false` | Gate events and sessions on `setTrackingConsent(true)`; see [Tracking consent](#tracking-consent) for push and storage behavior |
-| `trackSessions` | `true` | `Session Started` when a visit begins, `context.sessionId` on every event |
-| `trackAppLifecycle` | `false` | The `Application …` events |
-| `handleDeepLink` | `nil` | `(URL) -> Bool`, on the main thread: a tapped push's link; `true` when your app opened it itself |
-| `logLevel` | `.error` | `.none`, `.error` or `.debug` (event names and delivery counts; unified log subsystem `io.kirora.sdk`) |
-| `apiUrl` | `https://api.kirora.io` | Staging or a private deployment |
+| `clientKey` | Required | Workspace's public SDK key |
+| `fetchUserToken` | `nil` | `@Sendable () async throws -> String`; fetches a token from your server, with a 30-second SDK timeout |
+| `push` | `nil` | `.enabled` or `PushOptions(pushAppId:)` |
+| `requireTrackingConsent` | `false` | Require a tracking grant before behavioural collection |
+| `trackSessions` | `true` | Session events and `context.sessionId` |
+| `trackAppLifecycle` | `false` | Automatic application lifecycle events |
+| `logLevel` | `.error` | `.none`, `.error` or `.debug` |
+| `handleDeepLink` | `nil` | `@MainActor @Sendable (URL) -> Bool`; explicit push-link routing |
+| `apiUrl` | `https://api.kirora.io` | API origin for staging/private deployments |
+| `beforeSend` | `nil` | Synchronous redaction/drop hook before behavioural storage |
 
 ### Methods
 
-| Method | Answers | Does |
-| --- | --- | --- |
-| `identify(_ userToken: String? = nil) async throws` | | Signs the user in, registers the device for push if allowed, sends waiting events |
-| `logout() async` | | Sends what waits and detaches the device, for 5 seconds at most in all (a pending `identify()` included), then forgets the user and their unsent events. Never fails. See [Identify users](#identify-users) for retries |
-| `track(_ name:, properties:)` | at once | Queues an event; never throws |
-| `trackScreenView(_ name:)` | at once | `Screen Viewed` |
-| `setTrackingConsent(_ granted:)` | | The user's answer, remembered on the device |
-| `requestPushPermission() async` | `PushPermission` | iOS's prompt, then registration if granted |
-| `setPushConsent(_ granted:) async throws` | | Consent to marketing push, recorded with proof |
-| `flush() async` | | Attempts event delivery; returning does not guarantee acceptance. Also schedules pending app-open reports |
-| `destroy()` | | Stops the client's timers and observers, without sending or deleting anything. Events still waiting stay for the next client |
+| Method | Result / behaviour |
+| --- | --- |
+| `identify(_ userToken: String? = nil) async throws` | Selects a user and attempts queued delivery/push registration |
+| `logout() async` | Attempts flush/detach, then clears local identity and that user's remaining events; bounded to five seconds |
+| `track(_ name: String, properties: [String: Any] = [:])` | Synchronously captures a snapshot for the queue; never throws |
+| `trackScreenView(_ name: String)` | Captures `Screen Viewed`; screens are not automatically detected |
+| `setTrackingConsent(_ granted: Bool)` | Applies and persists the tracking choice |
+| `requestPushPermission() async -> PushPermission` | Prompts through iOS when appropriate and attempts registration |
+| `getPushStatus() async -> PushStatus` | Reads OS permission and registration status; never prompts |
+| `setPushEnabled(_ enabled: Bool) async` | Changes this device's push preference; never throws |
+| `setPushConsent(_ granted: Bool) async throws` | Records the signed-in user's marketing choice |
+| `getState() -> KiroraState` | Local diagnostic snapshot; no prompt or network request |
+| `flush() async` | Attempts queued delivery without bypassing consent or `Retry-After` |
+| `destroy()` | Stops the client; queued events remain for a future client |
+
+`KiroraState` exposes `isInitialized`, `isIdentified`, `deviceId`, `sessionId`, `pushToken`, `trackingConsent`, `pushConsent` and `queuedEventCount`. It is for diagnostics, not proof of server acceptance or authorisation to send marketing push. `pushToken` is the token of the signed-in user's current registration, and `nil` before sign-in, after a failed registration, while push is off or while it's being detached.
 
 ### Errors
 
-- `KiroraApiError` (`status`, `code`, `message`, `retryAfterMs`): Kirora refused a call.
-- `UserTokenError` (`underlying`): `fetchUserToken` failed or timed out.
-- `KiroraError` (`message`): no token to sign in with, or an `apiUrl` that isn't an address.
+SDK errors use the `KiroraError` base class:
 
-None is thrown by `track()`: an event Kirora refuses is logged.
+- `KiroraApiError`: API status, optional error `code` and `retryAfterMs`.
+- `UserTokenError`: token callback failure/timeout, with `underlying` cause.
+- `KiroraError`: setup or network failure, with a message and optional underlying error.
 
-## How it works
+Task cancellation can surface separately as `CancellationError`. Event tracking does not throw; rejected events are logged. Logging uses subsystem `io.kirora.sdk`; debug output includes event names and delivery counts. Keep sensitive values out of event names and token-callback errors.
 
-- **Batching.** Events go at once when 20 wait, otherwise every 30 seconds, when the app
-  goes to the background (with time asked from iOS to finish) and when the network comes
-  back. Batches hold up to 100 events.
-- **Offline delivery.** Up to 1,000 events are kept on disk across restarts; past that,
-  the oldest are dropped. Failed requests are retried with doubling gaps up to 5 minutes,
-  never sooner than `Retry-After`. Each event gets an idempotency key when it's tracked,
-  for server deduplication. Acknowledged events and permanent refusals are removed;
-  unacknowledged events wait for retry. Logout, consent withdrawal and queue overflow
-  also remove events. Writes are asynchronous, so an abrupt termination can lose recent
-  changes; delivery is not guaranteed.
-- **Users stay apart.** An event tracked while a user is signed in is only ever sent as
-  that user, even if another signs in before it's sent.
-- **Event context.** Each event carries `context.device.id`, `context.sessionId` (when
-  sessions are enabled),
-  `context.locale` (the user's language, `en-GB`) and `context.timezone`
-  (`Africa/Lagos`). Kirora adds the IP address and user agent itself.
-- **Clock skew.** Each batch says when it was sent, so Kirora corrects event times for a
-  device whose clock is wrong.
-- **Failure handling.** `track()` does not throw, and no answer from Kirora can break
-  your app: network failures are retried, never sooner than `Retry-After` (an absurd one
-  is cut to a week), and terminal refusals are logged.
+## Privacy and local storage
 
-## Privacy
+The SDK uses no IDFA, IDFV, Keychain or device model. It does not request App Tracking Transparency permission. Its installation ID is a random UUID in the app container, scoped to the client key and API deployment.
 
-To report how push notifications perform, the SDK sends:
+Files live under `Application Support/io.kirora.sdk/`. The directory is excluded from device backups. Events and state are JSON files protected by the app's storage environment; the SDK adds no application-level encryption. Do not put credentials or unnecessary sensitive data in event properties.
 
-- the app's version, the OS version, and the device's language and time zone, when it
-  registers the device;
-- the time the app is opened or returns to the foreground;
-- when a Kirora notification is shown or tapped.
+| Storage | Contents |
+| --- | --- |
+| `events-<hash>.json` | Bounded queued event snapshots, owners and idempotency keys |
+| `state.json` | Namespaced installation/session state, preferences, last registration, app version and pending influenced opens; APNs cache |
+| `consent.json` | Independent tracking-refusal copy |
+| Memory | User JWTs, active requests and detach retry credentials |
 
-It never sends hardware or advertising identifiers. The device id is a random value the
-SDK creates and keeps in the app's own storage; it is deleted with the app.
+Push registration metadata, notification receipts and taps are operational reports. Influenced app opens require behavioural tracking permission, a signed-in user and a push registration. They are separate from `Application Opened` events and can be reported even with lifecycle-event tracking disabled. Up to 50 pending opens are retained; those older than seven days are discarded. Their 30-minute spacing is saved with the visit; with `trackSessions: false` it's kept in memory only.
 
-The SDK uses no IDFA, IDFV or Keychain and does not request App Tracking Transparency
-permission. Both libraries include `PrivacyInfo.xcprivacy`: the main SDK declares product
-interaction, user id and device id collection; the extension declares product interaction
-for delivery reporting. The manifests mark this data as linked to the user and not used
-for tracking. The main SDK's product interaction purposes include app functionality,
-analytics and product personalization.
-
-App-open reporting is separate from `Application Opened` events. For a signed-in user
-with a push registration, it reports at most once per 30-minute visit, even when
-`trackAppLifecycle` is `false`. Up to 50 pending app opens are stored per workspace;
-reports older than seven days are dropped.
-
-### What the SDK stores
-
-Everything is in `Application Support/io.kirora.sdk/`, in your app's own container and
-left out of device backups, so a restored phone gets a new device id. All of it is
-deleted with the app.
-
-| File | Holds | Removed |
-| --- | --- | --- |
-| `events-<hash>.json` | Events waiting to be sent, per workspace | Once Kirora answers for them; the user's at `logout()`; all on consent withdrawal |
-| `state.json`, `device-id` | `device.id`: a random UUID | On consent withdrawal if no push registration remains; otherwise logout cleanup can remove it after detachment |
-| `state.json`, `session` | The visit's id and last activity | On consent withdrawal |
-| `state.json`, `tracking-consent` | The user's tracking consent answer | Never; it's their answer |
-| `state.json`, `app-version` | The app's version and build at the last launch, for lifecycle events | |
-| `state.json`, `app-open-activity` | Last app-open visit activity; only with push on | Overwritten on later lifecycle activity |
-| `state.json`, `app-opens:…` | App opens waiting to be reported, per workspace | After reporting, at logout for that user, or when older than seven days during delivery |
-| `state.json`, `apns-token` | Last APNs token | Overwritten when refreshed; not cleared by logout |
-| `state.json`, `push-registration:…` | User, push app, token and registration time, per workspace | After successful detachment; retained if detachment fails |
-| Memory only | User token | Active identity is cleared at logout; detachment work can retain the old token until it finishes or stops |
-
-Queue files and push records are namespaced by client key and API host. Device id,
-tracking consent and session state are shared within the app. Use one client per app;
-independent clients writing the same files are not coordinated.
-
-## Naming events
-
-Segments, journeys and goals match event names exactly, so keep them consistent:
-
-- Use an object followed by a past-tense action, in Title Case: `Plan Upgraded`,
-  `Invoice Paid`, `Signup Started`.
-- Name what the user did, not where: `Order Completed` with `["source": "checkout"]`,
-  not `Checkout Screen Button Tapped`.
-- Put details in properties: `Plan Upgraded` with `["plan": "pro"]`, not
-  `Pro Plan Upgraded`.
-- Use the standard e-commerce names where they apply: `Product Viewed`, `Product Added`,
-  `Order Completed` and so on.
-- Names starting with `contact.` are reserved.
+Both products include a `PrivacyInfo.xcprivacy` manifest. Review your app's complete data collection and App Store disclosures for the events you choose to send; a bundled SDK manifest does not describe all app-supplied properties.
 
 ## Verify your integration
 
-1. Request your token route signed out: expect `401`. Signed in, expect a plain-text JWT
-   for the session user.
-2. Temporarily set `logLevel: .debug`, identify a signed-in user and track an event. In
-   Console.app, filter on subsystem `io.kirora.sdk` and look for `Kirora: Sent … events`
-   within 30 seconds or after sending the app to the background. Debug logs include event
-   names; remove the setting after checking.
-3. If consent is required, check no events are sent before the user agrees, and that
-   withdrawing consent clears the event queue. Push is separate: see
-   [Tracking consent](#tracking-consent).
-4. For push, run on a device (or a simulator on iOS 16+ with Apple silicon), allow
-   notifications, and send a test push from the dashboard.
-5. Use a regular campaign push to verify delivery and tap reports; dashboard test sends
-   without `trackingUrl` cannot verify reporting. Check foreground display, a cold-start
-   tap, image attachments, notification permission changes in Settings and logout offline.
+1. Confirm your token endpoint returns `401` signed out and a token naming the session user signed in.
+2. Verify that opt-in blocks behavioural events before consent, then check one event in Kirora after consent and identification.
+3. Confirm queued events remain with the correct user across offline use, account changes and restarts.
+4. Test push on an appropriately provisioned iOS device. Check permission changes, foreground presentation and a tap that launches the app.
+5. Use a regular campaign notification to check delivery/tap reporting. A dashboard test without `trackingUrl` cannot verify metrics.
+6. Test image attachments with the extension, mixed-provider notifications, custom links and offline logout.
 
 ## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
-| Events stay queued | Call `identify()` at every start while signed in; check tracking consent, connectivity and your token route. |
-| Token fails, or Kirora answers `401` | Sign with the workspace's token secret, the session user's id as `sub`, and an unexpired token valid for at most 24 hours. |
-| "iOS gave no APNs token" | Add the Push Notifications capability, and check the provisioning profile includes it. |
-| "This push app sends through Firebase, but the app has no Firebase token" | Add FirebaseMessaging, call `FirebaseApp.configure()`, and upload your APNs key to Firebase. |
-| "No ready iOS push app" | Add an iOS push app with a valid APNs key in the dashboard, or check `pushAppId`. |
-| Taps aren't reported, or links don't open | If `KiroraAppDelegateProxyEnabled` is `NO`, forward the callbacks as in [Without the automatic integration](#without-the-automatic-integration). |
-| No delivered counts, or no images | Add the [Notification Service Extension](#delivery-reports-and-images). |
+| Events stay queued | Identification, tracking choice, connectivity and token endpoint. `flush()` is an attempt, not a delivery receipt. |
+| `401` or token error | Workspace secret, authenticated `sub`, token expiry and callback response handling. Never log the token. |
+| No APNs token | Push capability, matching bundle/provisioning settings and manual callback forwarding if the proxy is disabled. |
+| No Firebase token | FirebaseMessaging installation, `FirebaseApp.configure()` and Firebase's APNs configuration. |
+| Permission granted but status disabled | Identify the user, enable device push and inspect registration/network errors. |
+| No image or delivered metric | Extension target/product/configuration, valid payload and connectivity; dashboard tests may not carry tracking URLs. |
+| Link does not open in the app | In a scene-based app, claim your own universal links in `handleDeepLink`; otherwise they open in the browser. |
+| No action buttons | Notification categories and category assignment; parsing a `buttons` field alone is insufficient. |
 
 ## Support and contributing
 
-For integration help, email [support@kirora.io](mailto:support@kirora.io). See
-[CONTRIBUTING.md](CONTRIBUTING.md) for local development, and [SECURITY.md](SECURITY.md)
-to report vulnerabilities privately.
+Report integration issues through the repository's issues with your SDK/iOS versions and a redacted description. Send vulnerabilities to **security@kirora.io**; see [SECURITY.md](SECURITY.md). For development instructions, see [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md).
 
-## License
-
-MIT. See [LICENSE](LICENSE).
+Licensed under the [MIT License](LICENSE).

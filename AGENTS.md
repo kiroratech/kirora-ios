@@ -28,6 +28,9 @@ see the [README](README.md) instead.
   integration (app-delegate swizzle, notification-center delegate proxy), which is the
   only code behind `#if canImport(UIKit)`.
 - `Sources/KiroraNotificationService/`: the extension helper.
+- `Sources/Kirora/Wrapper/`: what wrapper SDKs (React Native, Flutter) call, as
+  `@_spi(Wrapper)`; not for apps.
+- `Kirora.podspec`, `KiroraNotificationService.podspec`: CocoaPods, for apps and wrappers.
 - `Tests/KiroraTests/`: swift-testing, against a fake Kirora (`Support.swift`). UIKit is
   behind protocols (`AppLifecycleSource`, `PushPlatform`), so the tests run on macOS.
 
@@ -46,4 +49,9 @@ and typecheck the UIKit code (Mac Catalyst works without the iOS SDK):
 With Xcode installed, also build for iOS: `xcodebuild -scheme Kirora-Package -destination 'generic/platform=iOS'`.
 
 Update the README if public behaviour or setup changed, and `CHANGELOG.md` for any change
-users will notice. Bump `sdkVersion` in `Sources/Kirora/Internal/Support.swift` on release.
+users will notice. Bump `sdkVersion` in `Sources/Kirora/Internal/Support.swift` on release, and `s.version`
+in `Kirora.podspec` and `KiroraNotificationService.podspec` to match (a test checks); tag
+the release with the same version, as the podspecs' `source` names it.
+
+`@_spi(Wrapper)` (`Sources/Kirora/Wrapper/`) is what the React Native and Flutter SDKs use:
+change it only with them, and with "Wrapper SDKs" in the interface. See `docs/wrappers.md`.

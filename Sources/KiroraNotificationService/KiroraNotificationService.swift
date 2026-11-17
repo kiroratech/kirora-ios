@@ -63,12 +63,12 @@ public enum KiroraNotificationService {
     }
 
     /// A Kirora push's tracking and image addresses, or nil for anyone else's push. Kirora's
-    /// says so: the `kirora` marker, or, from servers before it, a `trackingUrl` at Kirora's
-    /// tracking path. `imageUrl` is a name any provider might use, so it alone never counts.
+    /// carries the `kirora` marker; `trackingUrl` and `imageUrl` are names any provider might
+    /// use, so they alone never count.
     static func kiroraPush(_ userInfo: [AnyHashable: Any]) -> (trackingUrl: URL?, imageUrl: URL?)? {
+        guard userInfo["kirora"] != nil else { return nil }
         let trackingUrl = (userInfo["trackingUrl"] as? String).flatMap(URL.init(string:))
             .flatMap { ["https", "http"].contains($0.scheme?.lowercased() ?? "") ? $0 : nil }
-        guard userInfo["kirora"] != nil || trackingUrl?.path.hasPrefix("/t/p/") == true else { return nil }
         let imageUrl = (userInfo["imageUrl"] as? String).flatMap(URL.init(string:))
             .flatMap { $0.scheme?.lowercased() == "https" ? $0 : nil }
         return (trackingUrl, imageUrl)

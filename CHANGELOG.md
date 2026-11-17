@@ -2,15 +2,85 @@
 
 ## Unreleased
 
+- CocoaPods: `Kirora` and `KiroraNotificationService` pods, beside Swift Package Manager.
+- For the React Native and Flutter SDKs, which wrap this one (`@_spi(Wrapper)`, not for
+  apps): their own `Kirora-SDK` name, `fetchUserToken` answered across the bridge, a tap
+  listener that holds the latest ten taps until it's attached, and `handleDeepLink` and
+  foreground display asked across the bridge for 1.5 seconds at most, and
+  `installPushIntegration()` so the tap that launched the app is heard before the client
+  exists, its link waiting (10 seconds at most) until the wrapper's deep-link handler is set
+  up.
+
 - Clarify installation targets, client retention, token fetching and first-event setup.
 - Document consent boundaries, storage retention and best-effort push reporting.
 - Fix issues found in review:
+  - Storage that can't be read at launch (before the first unlock) is read again once it
+    can, and merged with what happened meanwhile, so tracking no longer stays off for the
+    rest of the session; push registration waits for it. Events tracked before the first
+    read can no longer overwrite such a file.
+  - An event whose `beforeSend` was still running when its user signed out, or when
+    consent was withdrawn, is dropped with the rest; one from before sign-in goes to the
+    user who signed in meanwhile.
+  - `track("")` is refused and logged, as on web, instead of being sent.
+  - A batch result that isn't Kirora's accepted or refused shape no longer clears its
+    event; it's retried.
+  - `getState().pushToken` is only the signed-in user's current registration's token.
+  - A detach never refreshes the outgoing user's token: a 401 ends it.
+  - Web links from a push are no longer handed to a scene delegate, which can't say
+    whether it opened them: unclaimed ones open with iOS. Scene-based apps claim their
+    own universal links in `handleDeepLink`.
+  - Lifecycle events are handled off the main thread, so launch never waits for the files.
+  - With `trackSessions: false`, app-open spacing is kept in memory only.
+  - Events cleared, or a value removed, while storage couldn't be read stay gone once it
+    can be; a flush cancelled at logout no longer returns before the send it was asked for;
+    a logout during a retried detach no longer starts a second one.
+- Follow the 17 November client SDK interface: a tracking refusal is also kept in a file of
+  its own, `consent.json`. When the saved answer can't be read, an app without
+  `requireTrackingConsent` tracks as on a fresh install unless a refusal is on record
+  (nothing while neither file can be read); with it, nothing until a fresh answer.
   - An oversized `Retry-After` can no longer crash the app.
   - Nothing is stored before tracking consent with push off.
   - `logout()` takes 5 seconds at most in all, a pending `identify()` included.
   - Starting the client no longer reads the disk on the calling thread.
   - `destroy()` during a detachment stops its retries.
-  - Only pushes marked as Kirora's, or with Kirora's tracking URL, are handled.
+  - Only pushes carrying Kirora's `kirora` marker are handled.
+- Document how long Kirora keeps an unseen device, and that transactional pushes need
+  only the notification permission.
+- Follow the 14 and 16 November client SDK interface:
+  - New `getPushStatus()` and `setPushEnabled(_:)`, for an app's own notifications setting.
+  - New `beforeSend` option, to redact or drop events before they're stored.
+  - New `getState()`, a read-only snapshot for support and debug screens.
+  - Event `context` carries `app`, `os`, `screen` and `device.manufacturer`/`type`, in
+    Segment's names, as Kirora now accepts them. No device model.
+  - Every error is a `KiroraError`: `KiroraApiError` and `UserTokenError` are now subclasses
+    of it, and a call that can't reach Kirora throws `KiroraError` with the network's error
+    as `underlying`. `UserTokenError.underlying` is now optional, as it's the base's.
+  - `identify()` throws `KiroraError` for an `apiUrl` that isn't an address, and
+    `setPushConsent(_:)` throws whenever Kirora hasn't recorded the choice.
+  - App opens for push reports now need tracking consent; withdrawing it drops waiting ones.
+  - Events from before sign-in become the signing-in user's, and never go as a later user.
+    What's tracked while `logout()` runs waits for the next user.
+  - A visit belongs to its user: logout ends it, and a new user begins their own.
+  - An event holding values JSON can't hold faithfully (`NaN`, infinity, unsupported
+    objects) is dropped instead of sent changed; a `nil` member is left out, not `null`.
+  - Events Kirora refuses for now (`RATE_LIMITED`, `INTERNAL_ERROR`,
+    `SERVICE_UNAVAILABLE`) are retried instead of dropped.
+  - The queue also keeps at most 1,000,000 bytes.
+  - Another user's sign-in no longer cancels the detachment of a signed-out user's device;
+    only a successful registration that takes the device over ends it.
+  - Device id, visit, consent and app state are kept per workspace.
+  - A saved consent answer that can't be read no longer falls back to the default.
+  - A tapped notification button opens its link.
+  - Withdrawing tracking consent cancels a send under way; `logout()` cancels a request
+    still running at its 5-second deadline (the detachment is then retried).
+  - When events can't be saved, the SDK says so once: they're kept in memory, within the
+    same limits, and won't survive a restart.
+  - Every detachment (`logout()`, `setPushEnabled(false)`) names the device's last
+    registration (`DELETE /devices/{id}?lastSeenAt=`), so a late retry can't undo a newer
+    sign-in; Kirora's answer (204, 409, another 4xx) ends it, not the device. The
+    registration record, and the device id, are kept until Kirora confirms.
+  - Clients in one app share one copy of each file, so two workspaces' clients no longer
+    overwrite each other's saved state, and two clients never adopt the same events.
 
 ## 0.1.0
 

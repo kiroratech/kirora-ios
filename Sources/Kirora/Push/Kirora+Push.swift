@@ -46,9 +46,26 @@ extension Kirora {
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) -> Bool {
-        guard let options = foregroundPresentation(for: notification.request.content.userInfo) else { return false }
-        completionHandler(options)
+        let userInfo = notification.request.content.userInfo
+        guard foregroundPresentation(for: userInfo) != nil else { return false }
+        presentInForeground(userInfo, completionHandler)
         return true
+    }
+
+    /// Shows a Kirora push in the foreground, unless a wrapper's app says not to (asked for
+    /// 1.5 seconds at most). Not for anyone else's push.
+    static func presentInForeground(
+        _ userInfo: [AnyHashable: Any],
+        _ completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        guard let options = foregroundPresentation(for: userInfo) else { return completionHandler([]) }
+        guard wrapperCallbacks.current.foreground != nil else { return completionHandler(options) }
+        let data = UncheckedSendable(wrapperData(userInfo))
+        let completion = UncheckedSendable(completionHandler)
+        Task {
+            let show = await wrapperShowsInForeground(data.value)
+            completion.value(show ? options : [])
+        }
     }
 
     /// Kirora pushes show while the app is open, as they would outside it; anyone else's
@@ -72,14 +89,29 @@ extension Kirora {
         switch response.actionIdentifier {
         case UNNotificationDefaultActionIdentifier: action = .open
         case UNNotificationDismissActionIdentifier: action = .dismiss
-        default: action = .other
+        default: action = .button(response.actionIdentifier)
         }
-        let handleDeepLink = deepLinkHandler.current
         let handler = PushTapHandler(openURL: { url in
-            await MainActor.run { openPushLink(url, handleDeepLink: handleDeepLink) }
+            // A wrapper's launch tap waits for its handler; a later tap may take its place.
+            if deepLinkHandler.current == nil, !(await launchLinks.proceed()) { return }
+            // The app's own handler first, then a wrapper's (1.5 seconds at most), then the SDK.
+            let handleDeepLink = deepLinkHandler.current
+            if await MainActor.run(body: { handleDeepLink?(url) == true }) { return }
+            if await wrapperOpenedLink(url) { return }
+            await MainActor.run { openPushLink(url, handleDeepLink: nil) }
         })
+        let data = UncheckedSendable(wrapperData(request.content.userInfo))
+        let actionIdentifier = response.actionIdentifier
+        // Not called for a dismissal.
+        let tapped: @Sendable (URL?) -> Void = { link in
+            var buttonIndex: Int?
+            if case .button(let identifier) = action { buttonIndex = payload.buttonIndex(for: identifier) }
+            pushTapEvents.deliver(KiroraPushTap(
+                data: data.value, buttonIndex: buttonIndex, actionIdentifier: actionIdentifier, link: link
+            ))
+        }
         // The app may be suspended right after the tap is handed back to iOS.
-        runWithBackgroundTime("Kirora push tap") { await handler.handle(payload, action: action) }
+        runWithBackgroundTime("Kirora push tap") { await handler.handle(payload, action: action, tapped: tapped) }
         return true
     }
 }

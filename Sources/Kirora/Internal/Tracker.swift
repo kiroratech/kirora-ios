@@ -9,34 +9,99 @@ let sessionTimeout: Double = 30 * 60
 let sessionKeepAlive: Double = 5 * 60
 
 /// Tracking consent. With `requireTrackingConsent`, nothing is tracked until the user says
-/// yes; without it, until they say no. The answer is remembered on the device.
+/// yes; without it, until they say no. The answer is kept in the app's store, per
+/// workspace: in memory at once, shared by every client of the workspace, and saved.
+///
+/// A refusal is also kept in a second store of its own (`consent.json`, which nothing else
+/// writes), so losing or corrupting either file can't lose it: either one saying
+/// `refused` is a refusal, and a grant clears both.
+///
+/// If the main store's answer was lost (its file couldn't be read), a grant is never
+/// assumed. With `requireTrackingConsent`, nothing is tracked until a fresh answer. Without
+/// it, tracking goes on as on a fresh install, but only once the refusal copy has been read
+/// and holds no refusal; while it can't be read either, nothing is tracked.
 struct TrackingConsent: Sendable {
     let store: KeyValueStore
+    /// The second copy of a refusal.
+    let refusals: KeyValueStore
     let required: Bool
+    let log: Log
+    private let warned = Locked(false)
 
-    var allowed: Bool {
-        let answer = store.string(StorageKeys.trackingConsent)
-        return required ? answer == "granted" : answer != "refused"
+    init(store: KeyValueStore, refusals: KeyValueStore, required: Bool, log: Log = Log(level: .none)) {
+        self.store = store
+        self.refusals = refusals
+        self.required = required
+        self.log = log
     }
 
-    /// The user said no, as opposed to not having answered yet.
-    var refused: Bool { store.string(StorageKeys.trackingConsent) == "refused" }
+    var allowed: Bool {
+        // One read of each copy; whether the main one was lost is asked only without an answer.
+        let answer = store.string(StorageKeys.trackingConsent)
+        if answer == "refused" || refusals.string(StorageKeys.trackingConsent) == "refused" { return false }
+        if answer == "granted" { return true }
+        guard Self.lost(store) else { return !required }
+        if required {
+            warnOnce("The saved tracking consent answer can't be read: nothing is tracked until setTrackingConsent(_:) is called again")
+            return false
+        }
+        if Self.lost(refusals) {
+            warnOnce("The saved tracking consent answer can't be read, nor whether the user refused: nothing is tracked until one can be, or setTrackingConsent(_:) is called again")
+            return false
+        }
+        warnOnce("The saved tracking consent answer can't be read; no refusal is on record, so tracking goes on as on a fresh install")
+        return true
+    }
 
-    /// Records the answer. True if tracking has just become allowed.
+    /// The user said no, as opposed to not having answered yet: in either copy.
+    var refused: Bool {
+        store.string(StorageKeys.trackingConsent) == "refused"
+            || refusals.string(StorageKeys.trackingConsent) == "refused"
+    }
+
+    /// Records the answer, in both copies. True if tracking has just become allowed.
     func answer(_ granted: Bool) -> Bool {
         let newlyAllowed = granted && !allowed
+        // The refusal copy first, either way: a refusal is on record somewhere as soon as
+        // possible, and a grant leaves the main copy's refusal until the copy is cleared.
+        refusals.set(granted ? nil : "refused", for: StorageKeys.trackingConsent)
         store.set(granted ? "granted" : "refused", for: StorageKeys.trackingConsent)
+        // A fresh answer: whatever either file lost no longer matters to this workspace.
+        if Self.lost(store) { store.set("0", for: StorageKeys.trackingConsentUnknown) }
+        if Self.lost(refusals) { refusals.set("0", for: StorageKeys.trackingConsentUnknown) }
+        if store.writeFailed || (!granted && refusals.writeFailed) {
+            log.error("The tracking consent answer can't be saved on this device: it holds until the app is closed, then ask again")
+        }
         return newlyAllowed
+    }
+
+    private func warnOnce(_ message: String) {
+        if warned.claimOnce() { log.error(message) }
+    }
+
+    /// Whether what `store` held for this workspace may have been lost (its file couldn't be
+    /// read, or decoded), with no fresh answer since.
+    private static func lost(_ store: KeyValueStore) -> Bool {
+        switch store.string(StorageKeys.trackingConsentUnknown) {
+        case "1": return true
+        case "0": return false
+        default: return store.string(StorageKeys.stateUnreadable) == "1"
+        }
     }
 }
 
 /// The current visit, kept in device storage so a relaunch continues it. Read once and kept
 /// in memory; written when a visit starts, when the app goes to the background, and at most
 /// once a minute otherwise: a minute is nothing against the 30-minute timeout.
+///
+/// A visit is its owner's: the user signed in when it began, or nobody. A different user's
+/// activity begins a visit of their own; one begun before sign-in becomes the user's.
 final class Sessions: @unchecked Sendable {
     private struct Stored: Codable, Equatable {
         var sessionId: String
         var lastActivityAt: Int64
+        /// Whose visit: the token subject, or nil before sign-in.
+        var owner: String?
     }
 
     /// The visit as last recorded, and when it was last written.
@@ -57,12 +122,14 @@ final class Sessions: @unchecked Sendable {
         self.now = now
     }
 
-    /// Records activity on the current visit. `started` is true if a new one began.
-    func touch() -> (sessionId: String, started: Bool) {
+    /// Records `owner`'s activity on the current visit. `started` is true if a new one began.
+    func touch(owner: String?) -> (sessionId: String, started: Bool) {
         state.withLock { state in
-            let live = liveSessionId(&state)
+            var live = liveSessionId(&state)
+            if live != nil, let owner, let current = state.current?.owner, current != owner { live = nil }
             let sessionId = live ?? newId()
-            record(sessionId, &state, writeNow: live == nil)
+            let keptOwner = owner ?? (live == nil ? nil : state.current?.owner)
+            record(sessionId, owner: keptOwner, &state, writeNow: live == nil || keptOwner != state.current?.owner)
             return (sessionId, live == nil)
         }
     }
@@ -71,20 +138,31 @@ final class Sessions: @unchecked Sendable {
     /// ends a visit but a timer alone never begins one. `writeNow` before suspension.
     func keepAlive(writeNow: Bool = false) {
         state.withLock { state in
-            if let sessionId = liveSessionId(&state) { record(sessionId, &state, writeNow: writeNow) }
+            if let sessionId = liveSessionId(&state) {
+                record(sessionId, owner: state.current?.owner, &state, writeNow: writeNow)
+            }
         }
     }
 
-    func end() {
+    /// The current visit's id, if one is live; neither starts nor extends one.
+    var currentId: String? { state.withLock { liveSessionId(&$0) } }
+
+    /// Ends the visit; with an `owner`, only if it's theirs, as they sign out (one begun
+    /// since, by nobody, goes on, and becomes the next user's).
+    func end(ifOwnedBy owner: String? = nil) {
         state.withLock { state in
+            if let owner {
+                _ = liveSessionId(&state)
+                guard state.current?.owner == owner else { return }
+            }
             state = State(loaded: true)
             store.set(nil, for: StorageKeys.session)
         }
     }
 
-    private func record(_ sessionId: String, _ state: inout State, writeNow: Bool) {
+    private func record(_ sessionId: String, owner: String?, _ state: inout State, writeNow: Bool) {
         let at = epochMs(now())
-        state.current = Stored(sessionId: sessionId, lastActivityAt: at)
+        state.current = Stored(sessionId: sessionId, lastActivityAt: at, owner: owner)
         if writeNow || at - state.writtenAt >= Self.writeEvery {
             store.setJSON(state.current, for: StorageKeys.session)
             state.writtenAt = at
@@ -103,23 +181,49 @@ final class Sessions: @unchecked Sendable {
 }
 
 /// Turns what the app tracks into queued events: their time, visit and device, owned by
-/// whoever is signed in. Nothing is recorded without tracking consent, and nothing here
-/// throws: a failure is logged, so it never breaks the app.
+/// whoever is signed in, passed through the app's `beforeSend`. Nothing is recorded without
+/// tracking consent, and nothing here throws: a failure is logged, so it never breaks the app.
 ///
-/// Everything runs on the caller's thread under one lock, so events are queued in the
-/// order they're tracked, with the user signed in at that moment.
+/// Everything runs on the caller's thread. Events are built under one lock, with the user
+/// signed in at that moment, and queued in the order they're tracked. The app's
+/// `beforeSend` runs outside the lock, so a hook that waits on another thread that is
+/// itself tracking can't freeze the app; with a hook, events tracked at the same moment on
+/// different threads may be queued in either order (each keeps its own time).
 final class Tracker: @unchecked Sendable {
     private let identity: Identity
     private let queue: EventQueue
     private let consent: TrackingConsent
     private let sessions: Sessions
+
+    /// The current visit's id, if one is live.
+    var currentSessionId: String? { sessions.currentId }
     private let deviceId: DeviceId
     private let deviceInfo: DeviceInfo
     private let trackSessions: Bool
+    private let beforeSend: (@Sendable (BeforeSendEvent) throws -> BeforeSendEvent?)?
     private let log: Log
     private let now: @Sendable () -> Date
     private let onQueued: @Sendable (Int) -> Void
     private let lock = NSLock()
+    /// Events built under `lock`, waiting for `beforeSend` outside it. Only under `lock`.
+    private var drafts: [Draft] = []
+
+    /// An event as built, before `beforeSend`.
+    private struct Draft {
+        let name: String
+        let properties: [String: JSONValue]
+        let context: [String: JSONValue]
+        let occurredAt: String
+        let owner: String?
+        /// Its place in ``inFlight`` while `beforeSend` runs.
+        let id: Int
+    }
+
+    /// The events `beforeSend` is running for, outside the lock, by id, with their owners.
+    /// A clear under the lock (consent withdrawn, a logout) removes them here as it clears
+    /// the queue, and only those still here are queued once the hook returns.
+    private var inFlight: [Int: String?] = [:]
+    private var nextDraftId = 0
 
     init(
         identity: Identity,
@@ -129,6 +233,7 @@ final class Tracker: @unchecked Sendable {
         deviceId: DeviceId,
         deviceInfo: DeviceInfo,
         trackSessions: Bool,
+        beforeSend: (@Sendable (BeforeSendEvent) throws -> BeforeSendEvent?)? = nil,
         log: Log,
         now: @escaping @Sendable () -> Date,
         onQueued: @escaping @Sendable (Int) -> Void
@@ -140,21 +245,20 @@ final class Tracker: @unchecked Sendable {
         self.deviceId = deviceId
         self.deviceInfo = deviceInfo
         self.trackSessions = trackSessions
+        self.beforeSend = beforeSend
         self.log = log
         self.now = now
         self.onQueued = onQueued
     }
 
-    /// Builds the event right away so its time is accurate, then queues it.
+    /// Builds the event right away so its time is accurate, then queues it. Kirora decides
+    /// whether its name is acceptable.
     func track(_ name: String, properties: [String: JSONValue]) {
-        guard !name.isEmpty else {
-            log.error("Not tracked: an event needs a name")
-            return
-        }
         exclusively {
             guard consent.allowed else { return }
-            let sessionId = touchSession()
-            enqueue(name, properties, sessionId)
+            let owner = identity.capturingSubject
+            let sessionId = touchSession(owner)
+            capture(name, properties, sessionId, owner)
         }
     }
 
@@ -162,7 +266,7 @@ final class Tracker: @unchecked Sendable {
     func noteActivity() {
         exclusively {
             guard consent.allowed else { return }
-            _ = touchSession()
+            _ = touchSession(identity.capturingSubject)
         }
     }
 
@@ -179,60 +283,153 @@ final class Tracker: @unchecked Sendable {
     func trackAll(_ build: () -> [(String, [String: JSONValue])]) {
         exclusively {
             guard consent.allowed else { return }
+            let owner = identity.capturingSubject
             for (name, properties) in build() {
-                let sessionId = touchSession()
-                enqueue(name, properties, sessionId)
+                let sessionId = touchSession(owner)
+                capture(name, properties, sessionId, owner)
             }
         }
     }
 
-    /// Forgets queued events and the visit, as when consent is withdrawn; if `condition`
-    /// holds, checked under the same lock as tracking, so an event tracked right after
-    /// consent is granted is never forgotten with the rest.
-    @discardableResult
-    func forget(if condition: () -> Bool = { true }) -> Bool {
-        var forgot = false
-        exclusively {
-            guard condition() else { return }
-            queue.clearAll()
-            sessions.end()
-            forgot = true
-        }
-        return forgot
-    }
-
-    private func exclusively(_ body: () -> Void) {
+    /// Ends `owner`'s visit, as they sign out: the next activity begins a new one.
+    func endSession(ownedBy owner: String) {
         lock.lock()
         defer { lock.unlock() }
+        sessions.end(ifOwnedBy: owner)
+    }
+
+    /// Forgets queued events and the visit, as when consent is withdrawn; if `condition`
+    /// holds, checked under the same lock as tracking, so an event tracked right after
+    /// consent is granted is never forgotten with the rest. Never refused, even from
+    /// inside `beforeSend`.
+    @discardableResult
+    func forget(if condition: () -> Bool = { true }) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard condition() else { return false }
+        queue.clearAll()
+        sessions.end()
+        inFlight = [:]
+        return true
+    }
+
+    /// Forgets `owner`'s queued events, as they sign out, including one being built for
+    /// them right now.
+    func forgetEvents(ownedBy owner: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        queue.clearOwned { stored, _ in stored == owner }
+        inFlight = inFlight.filter { $0.value != owner }
+    }
+
+    /// Runs `body` under the lock, then passes what it built through `beforeSend` and queues
+    /// it.
+    private func exclusively(_ body: () -> Void) {
+        // An app's beforeSend that tracks would otherwise call itself without end.
+        // Only a hook sets the flag: without one, no thread lookup.
+        guard beforeSend == nil || !inBeforeSendOnThisThread else {
+            log.error("Not tracked: called from beforeSend")
+            return
+        }
+        lock.lock()
         body()
+        let built = drafts
+        drafts = []
+        lock.unlock()
+        guard !built.isEmpty else { return }
+        let redactedEvents = built.compactMap { draft in
+            redacted(draft.name, draft.properties, draft.context).map { (draft, $0.0, $0.1) }
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        // Those a clear didn't take while the hook ran (consent withdrawn, their user signed out).
+        let live = Set(built.map(\.id).filter { inFlight.removeValue(forKey: $0) != nil })
+        // The hook may have withdrawn consent.
+        guard consent.allowed else { return }
+        for (draft, properties, context) in redactedEvents where live.contains(draft.id) {
+            // From before sign-in, with a sign-in since: that user adopts it, as they adopted
+            // what was queued already.
+            let owner = draft.owner ?? identity.capturingSubject
+            enqueue(QueuedEvent(
+                idempotencyKey: newId(), name: draft.name, properties: properties,
+                occurredAt: draft.occurredAt, context: context
+            ), owner: owner)
+        }
+    }
+
+    /// True on a thread running the app's `beforeSend`.
+    private var inBeforeSendOnThisThread: Bool {
+        Thread.current.threadDictionary[beforeSendThreadKey] != nil
     }
 
     /// The visit's id, if visits are on, starting one if needed.
-    private func touchSession() -> String? {
+    private func touchSession(_ owner: String?) -> String? {
         guard trackSessions else { return nil }
-        let (sessionId, started) = sessions.touch()
+        let (sessionId, started) = sessions.touch(owner: owner)
         // Mobile SDKs track `Session Started` without properties.
-        if started { enqueue(sessionStartedEvent, [:], sessionId) }
+        if started { capture(sessionStartedEvent, [:], sessionId, owner) }
         return sessionId
     }
 
-    /// Queues as the current user (if any), then lets delivery decide when to send.
-    private func enqueue(_ name: String, _ properties: [String: JSONValue], _ sessionId: String?) {
-        let event = QueuedEvent(
-            idempotencyKey: newId(),
-            name: name,
-            properties: properties,
-            occurredAt: isoTimestamp(now()),
-            context: EventContext(
-                sessionId: sessionId,
-                // Will let Kirora link activity from before sign-in to the user later.
-                device: .init(id: deviceId.value()),
-                locale: deviceInfo.locale(),
-                timezone: deviceInfo.timezone()
-            )
-        )
-        let waiting = queue.add(event, owner: identity.user?.subject)
-        log.debug("Queued \(name)")
+    /// Makes the event and queues it as `owner`'s, or, with a `beforeSend`, leaves it for
+    /// the hook outside the lock. Its time is taken first, so a slow hook doesn't move it.
+    /// Under `lock`.
+    private func capture(_ name: String, _ properties: [String: JSONValue], _ sessionId: String?, _ owner: String?) {
+        let occurredAt = isoTimestamp(now())
+        // device.id will let Kirora link activity from before sign-in to the user later.
+        let context = deviceInfo.eventContext(deviceId: deviceId.value(), sessionId: sessionId)
+        guard beforeSend == nil else {
+            nextDraftId += 1
+            inFlight[nextDraftId] = .some(owner)
+            drafts.append(Draft(name: name, properties: properties, context: context, occurredAt: occurredAt, owner: owner, id: nextDraftId))
+            return
+        }
+        enqueue(QueuedEvent(
+            idempotencyKey: newId(), name: name, properties: properties,
+            occurredAt: occurredAt, context: context
+        ), owner: owner)
+    }
+
+    /// Under `lock`.
+    private func enqueue(_ event: QueuedEvent, owner: String?) {
+        let waiting = queue.add(event, owner: owner)
+        log.debug("Queued \(event.name)")
         onQueued(waiting)
     }
+
+    /// The event as `beforeSend` leaves it, or nil if it drops it. Only a failure's kind is
+    /// logged, never the event: it may be what the hook was there to hide.
+    private func redacted(
+        _ name: String, _ properties: [String: JSONValue], _ context: [String: JSONValue]
+    ) -> ([String: JSONValue], [String: JSONValue])? {
+        guard let beforeSend else { return (properties, context) }
+        let event = BeforeSendEvent(
+            name: name,
+            properties: properties.mapValues(\.foundationValue),
+            context: context.mapValues(\.foundationValue)
+        )
+        let answer: BeforeSendEvent?
+        let thread = Thread.current.threadDictionary
+        thread[beforeSendThreadKey] = true
+        defer { thread.removeObject(forKey: beforeSendThreadKey) }
+        do {
+            answer = try beforeSend(event)
+        } catch {
+            log.error("\(name) not tracked: beforeSend threw")
+            return nil
+        }
+        guard let answer else {
+            log.debug("\(name) dropped by beforeSend")
+            return nil
+        }
+        do {
+            return (try JSONValue.fromObject(answer.properties), try JSONValue.fromObject(answer.context))
+        } catch {
+            log.error("\(name) not tracked: beforeSend answered \(error)")
+            return nil
+        }
+    }
 }
+
+/// Marks a thread running the app's `beforeSend`.
+private let beforeSendThreadKey = "io.kirora.sdk.inBeforeSend"

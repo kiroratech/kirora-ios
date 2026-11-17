@@ -24,19 +24,28 @@ struct URLSessionTransport: HTTPTransport {
         return URLSession(configuration: configuration)
     }()
 
+    /// Cancelling the calling task cancels the request.
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         // `data(for:)` is iOS 15; this works back to iOS 13.
-        try await withCheckedThrowingContinuation { continuation in
-            let task = Self.session.dataTask(with: request) { data, response, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else if let response = response as? HTTPURLResponse {
-                    continuation.resume(returning: (data ?? Data(), response))
-                } else {
-                    continuation.resume(throwing: URLError(.badServerResponse))
+        let task = Locked<URLSessionDataTask?>(nil)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let dataTask = Self.session.dataTask(with: request) { data, response, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else if let response = response as? HTTPURLResponse {
+                        continuation.resume(returning: (data ?? Data(), response))
+                    } else {
+                        continuation.resume(throwing: URLError(.badServerResponse))
+                    }
                 }
+                task.withLock { $0 = dataTask }
+                dataTask.resume()
+                // Cancelled before the task existed: the handler below found nothing to cancel.
+                if Task.isCancelled { dataTask.cancel() }
             }
-            task.resume()
+        } onCancel: {
+            task.current?.cancel()
         }
     }
 }
@@ -55,8 +64,13 @@ final class ClientAPI: Sendable {
     let namespace: String
     /// Why `apiUrl` can't be used, if it can't. Creating the client never throws.
     let urlProblem: String?
+    /// `Kirora-SDK`, as it was when the client was created.
+    private let sdk: String
+    /// Told when Kirora refuses a user's token for good, even after a refresh.
+    let onTokenRefused = Locked<(@Sendable (SignedInUser) -> Void)?>(nil)
 
-    init(clientKey: String, apiUrl: String, identity: Identity, transport: HTTPTransport) {
+    init(clientKey: String, apiUrl: String, identity: Identity, transport: HTTPTransport, sdk: String = sdkName) {
+        self.sdk = sdk
         self.clientKey = clientKey
         self.identity = identity
         self.transport = transport
@@ -85,7 +99,8 @@ final class ClientAPI: Sendable {
         _ path: String,
         query: [URLQueryItem] = [],
         body: (any Encodable & Sendable)? = nil,
-        as requestedUser: SignedInUser? = nil
+        as requestedUser: SignedInUser? = nil,
+        refreshing: Bool = true
     ) async throws -> JSONValue? {
         guard let baseURL else { throw KiroraError(urlProblem ?? "apiUrl is not an address") }
         guard let user = requestedUser ?? identity.user else {
@@ -93,30 +108,36 @@ final class ClientAPI: Sendable {
         }
         let request = try makeRequest(baseURL, method, path, query, body)
         let sentToken = user.token
-        if let answer = try await send(request, token: sentToken) { return answer.value }
-
-        // Kirora refused the token: get a fresh one, once, and try again with it.
-        if let freshToken = try await identity.refresh(user, refusedToken: sentToken),
-           let answer = try await send(request, token: freshToken) {
-            return answer.value
+        do {
+            return try await send(request, token: sentToken, as: user)
+        } catch let refused as KiroraApiError where refused.status == 401 && refreshing {
+            // Kirora refused the token: get a fresh one, once, and try again with it. (A
+            // detachment doesn't: it uses the outgoing user's token as captured.)
+            guard let freshToken = try await identity.refresh(user, refusedToken: sentToken) else {
+                onTokenRefused.current?(user)
+                throw refused
+            }
+            do {
+                return try await send(request, token: freshToken, as: user)
+            } catch let again as KiroraApiError where again.status == 401 {
+                onTokenRefused.current?(user)
+                throw again
+            }
         }
-        throw KiroraApiError(status: 401, code: "UNAUTHORIZED", message: "Kirora answered 401")
     }
 
-    private struct Answer { let value: JSONValue? }
-
-    /// One call. Nil for a 401, so the caller can refresh the token.
-    private func send(_ template: URLRequest, token: String) async throws -> Answer? {
+    /// One call; Kirora's answer to it is `user`'s token accepted. A 401 is thrown like any
+    /// other refusal, with Kirora's own code and message.
+    private func send(_ template: URLRequest, token: String, as user: SignedInUser) async throws -> JSONValue? {
         var request = template
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await transport.send(request)
-        if response.statusCode == 401 { return nil }
         guard (200..<300).contains(response.statusCode) else {
             throw apiError(response, data)
         }
-        if response.statusCode == 204 || data.isEmpty { return Answer(value: nil) }
-        let decoded = try? JSONDecoder().decode(JSONValue.self, from: data)
-        return Answer(value: decoded?["data"])
+        user.confirm()
+        if response.statusCode == 204 || data.isEmpty { return nil }
+        return (try? JSONDecoder().decode(JSONValue.self, from: data))?["data"]
     }
 
     private func makeRequest(
@@ -129,7 +150,7 @@ final class ClientAPI: Sendable {
         var request = URLRequest(url: url, timeoutInterval: requestTimeoutSeconds)
         request.httpMethod = method
         request.setValue(clientKey, forHTTPHeaderField: "Kirora-Client-Key")
-        request.setValue(sdkName, forHTTPHeaderField: "Kirora-SDK")
+        request.setValue(sdk, forHTTPHeaderField: "Kirora-SDK")
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONEncoder().encode(body)

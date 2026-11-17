@@ -10,7 +10,9 @@ private let maxPendingAppOpens = 50
 /// or not the app tracks lifecycle events, and never counted against the plan.
 ///
 /// Only for a signed-in user on a device registered for push, at most once per visit (30
-/// minutes). Queued and retried as events are; dropped on 404 or 400, or once 7 days old.
+/// minutes), and only while behavioural tracking is allowed: nothing of it is stored or
+/// sent otherwise. Queued and retried as events are; dropped on 404 or 400, once 7 days
+/// old, and when tracking consent is withdrawn.
 final class AppOpens: @unchecked Sendable {
     private struct Pending: Codable, Equatable {
         var occurredAt: String
@@ -32,6 +34,7 @@ final class AppOpens: @unchecked Sendable {
     private let store: KeyValueStore
     private let registrar: PushRegistrar
     private let deviceId: DeviceId
+    private let consent: TrackingConsent
     private let log: Log
     private let now: @Sendable () -> Date
     private let key: String
@@ -39,11 +42,17 @@ final class AppOpens: @unchecked Sendable {
     /// When the app came to the foreground before anyone had signed in: claimed by a
     /// sign-in in the same foreground stay, as the app calls identify() at every start.
     private let unclaimed = Locked<Date?>(nil)
+    /// Where the spacing is kept: saved with visits on, so it holds across launches; in
+    /// memory with visits off, as no visit is stored.
+    private let spacing: KeyValueStore
 
     init(
         api: ClientAPI, identity: Identity, store: KeyValueStore, registrar: PushRegistrar,
-        deviceId: DeviceId, log: Log, timing: DeliveryTiming, now: @escaping @Sendable () -> Date
+        deviceId: DeviceId, consent: TrackingConsent, log: Log, timing: DeliveryTiming,
+        trackSessions: Bool = true, now: @escaping @Sendable () -> Date
     ) {
+        spacing = trackSessions ? store : MemoryKeyValueStore()
+        self.consent = consent
         self.api = api
         self.identity = identity
         self.store = store
@@ -58,12 +67,12 @@ final class AppOpens: @unchecked Sendable {
     /// The app launched or came to the foreground. Counted only if a new visit begins.
     /// Nothing is stored, or sent, unless push is on: app opens are push reporting.
     func appCameToForeground() {
-        guard registrar.enabled else { return }
+        guard collecting else { return }
         let at = now()
         let newVisit = isNewVisit(at)
         touchVisit()
         guard newVisit else { return }
-        if let user = identity.user {
+        if let user = identity.capturingUser {
             queue(at, for: user)
             send()
         } else {
@@ -73,23 +82,39 @@ final class AppOpens: @unchecked Sendable {
 
     /// Activity in the foreground keeps the visit going.
     func touchVisit() {
-        guard registrar.enabled else { return }
-        store.set(String(epochMs(now())), for: StorageKeys.appOpenActivity)
+        guard collecting else { return }
+        spacing.set(String(epochMs(now())), for: StorageKeys.appOpenActivity)
     }
 
     func appWentToBackground() {
-        guard registrar.enabled else { return }
+        guard collecting else { return }
         touchVisit()
         unclaimed.withLock { $0 = nil }
     }
 
     /// After sign-in and push registration: claim this start's open, and send what waits.
     func onSignedIn(_ user: SignedInUser) {
-        if let unclaimed = unclaimed.take() {
-            queue(unclaimed, for: user)
-        }
+        // `queue` checks consent.
+        if let unclaimed = unclaimed.take() { queue(unclaimed, for: user) }
         send()
     }
+
+    /// Tracking consent was withdrawn: forgets every waiting open, the visit's spacing and
+    /// any scheduled retry.
+    func forget() {
+        unclaimed.withLock { $0 = nil }
+        state.withLock { state in
+            state.retry?.cancel()
+            state.retry = nil
+            state.sending?.cancel()
+            state.pending = []
+        }
+        store.set(nil, for: key)
+        spacing.set(nil, for: StorageKeys.appOpenActivity)
+    }
+
+    /// App opens are push reporting that needs behavioural tracking consent.
+    private var collecting: Bool { registrar.enabled && consent.allowed }
 
     /// Forgets `subject`'s opens, at sign-out.
     func clear(owner subject: String) {
@@ -117,7 +142,7 @@ final class AppOpens: @unchecked Sendable {
 
     private func queue(_ at: Date, for user: SignedInUser) {
         // Never while unregistered for push: Kirora only credits a registered device.
-        guard let pushAppId = registrar.pushAppId(for: user) else { return }
+        guard consent.allowed, let pushAppId = registrar.pushAppId(for: user) else { return }
         modify { pending in
             pending.append(Pending(occurredAt: isoTimestamp(at), pushAppId: pushAppId, owner: user.subject))
             if pending.count > maxPendingAppOpens { pending.removeFirst(pending.count - maxPendingAppOpens) }
@@ -130,7 +155,7 @@ final class AppOpens: @unchecked Sendable {
         // Kirora takes an app open up to 7 days old.
         let oldest = now().addingTimeInterval(-appOpenMaxAge)
         modify { $0.removeAll { (parseIsoTimestamp($0.occurredAt) ?? .distantPast) < oldest } }
-        while identity.user === user, !state.withLock({ $0.destroyed }) {
+        while identity.user === user, !state.withLock({ $0.destroyed }), consent.allowed {
             guard let next = modify({ $0.first { $0.owner == user.subject } }) else {
                 state.withLock { $0.backoff.succeeded() }
                 return
@@ -151,7 +176,7 @@ final class AppOpens: @unchecked Sendable {
                 log.error("App open not sent", error)
                 return
             } catch {
-                retryLater(error)
+                if !Task.isCancelled { retryLater(error) }
                 return
             }
         }
@@ -172,7 +197,7 @@ final class AppOpens: @unchecked Sendable {
     }
 
     private func isNewVisit(_ at: Date) -> Bool {
-        guard let last = store.string(StorageKeys.appOpenActivity).flatMap(Int64.init) else { return true }
+        guard let last = spacing.string(StorageKeys.appOpenActivity).flatMap(Int64.init) else { return true }
         return Double(epochMs(at) - last) / 1000 >= sessionTimeout
     }
 

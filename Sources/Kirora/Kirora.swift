@@ -27,7 +27,8 @@ public final class Kirora: @unchecked Sendable {
     private let deviceId: DeviceId
     private let tracker: Tracker
     private let delivery: EventDelivery
-    private let push: PushRegistrar
+    /// Internal, for tests.
+    let push: PushRegistrar
     private let appOpens: AppOpens
     private let lifecycle: AppLifecycleSource
     private let lifecycleEvents: LifecycleEvents
@@ -36,6 +37,9 @@ public final class Kirora: @unchecked Sendable {
     private let logoutWait: Double
     private let destroyedFlag = Locked(false)
     private let stopObservingTokens: @Sendable () -> Void
+    /// The events a sign-in adopted, given back if Kirora refuses its token before ever
+    /// accepting it.
+    private let adoption = Locked<(user: SignedInUser, keys: Set<String>)?>(nil)
 
     /// Starts the client. Never throws and never blocks the app's launch: a bad option is
     /// logged, and the client then sends nothing.
@@ -58,9 +62,12 @@ public final class Kirora: @unchecked Sendable {
             identity: identity, transport: environment.transport
         )
         if let problem = api.urlProblem { log.error(problem) }
-        store = environment.store
-        queue = EventQueue(file: environment.eventsFile(api.namespace))
-        consent = TrackingConsent(store: store, required: options.requireTrackingConsent)
+        store = WorkspaceStore(base: environment.store, namespace: api.namespace)
+        queue = EventQueue.shared(file: environment.eventsFile(api.namespace), log: log)
+        consent = TrackingConsent(
+            store: store, refusals: WorkspaceStore(base: environment.refusals, namespace: api.namespace),
+            required: options.requireTrackingConsent, log: log
+        )
         deviceId = DeviceId(store: store)
         let delivery = EventDelivery(
             api: api, identity: identity, queue: queue,
@@ -72,7 +79,7 @@ public final class Kirora: @unchecked Sendable {
             identity: identity, queue: queue, consent: consent,
             sessions: Sessions(store: store, now: environment.now),
             deviceId: deviceId, deviceInfo: environment.deviceInfo,
-            trackSessions: options.trackSessions, log: log, now: environment.now,
+            trackSessions: options.trackSessions, beforeSend: options.beforeSend, log: log, now: environment.now,
             onQueued: { waiting in Task { await delivery.onEventQueued(waiting: waiting) } }
         )
         let releaseDeviceId = DeviceIdRelease(consent: consent, deviceId: deviceId)
@@ -87,10 +94,25 @@ public final class Kirora: @unchecked Sendable {
         self.releaseDeviceId = releaseDeviceId
         appOpens = AppOpens(
             api: api, identity: identity, store: store, registrar: push, deviceId: deviceId,
-            log: log, timing: environment.timing, now: environment.now
+            consent: consent, log: log, timing: environment.timing,
+            trackSessions: options.trackSessions, now: environment.now
         )
         lifecycle = environment.lifecycle
         lifecycleEvents = LifecycleEvents(store: store, deviceInfo: environment.deviceInfo)
+        // A sign-in Kirora never accepted gives back the events it adopted.
+        let queue = self.queue, adoption = self.adoption
+        api.onTokenRefused.withLock { hook in
+            hook = { user in
+                guard !user.confirmed,
+                      let adopted = adoption.withLock({ current -> Set<String>? in
+                          guard current?.user === user else { return nil }
+                          defer { current = nil }
+                          return current?.keys
+                      })
+                else { return }
+                queue.release(adopted, owner: user.subject)
+            }
+        }
 
         // A new APNs or Firebase token while signed in registers again.
         let push = self.push
@@ -102,6 +124,7 @@ public final class Kirora: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             if self.tracker.forget(if: { self.consent.refused }) {
+                self.appOpens.forget()
                 self.releaseDeviceId.ifUnneeded(registered: self.push.registered)
             }
         }
@@ -121,12 +144,18 @@ public final class Kirora: @unchecked Sendable {
     ///
     /// Also registers the device for push if the user allowed notifications.
     ///
-    /// - Throws: Only for the token: ``UserTokenError`` if `fetchUserToken` fails, or
-    ///   ``KiroraApiError`` with status 401 if Kirora refuses a fresh one too. A push
-    ///   registration that fails otherwise is logged.
+    /// - Throws: A ``KiroraError``, for the token or the setup: ``UserTokenError`` if
+    ///   `fetchUserToken` fails, ``KiroraApiError`` with status 401 if Kirora refuses a fresh
+    ///   one too, and ``KiroraError`` itself with no token and no `fetchUserToken`, or an
+    ///   `apiUrl` that isn't an address. A push registration that fails is logged.
     public func identify(_ userToken: String? = nil) async throws {
         guard !destroyed else { return }
-        try await identity.signIn(token: userToken) { [weak self] in try await self?.onSignedIn() }
+        if let problem = api.urlProblem { throw KiroraError(problem) }
+        do {
+            try await identity.signIn(token: userToken) { [weak self] in try await self?.onSignedIn() }
+        } catch {
+            throw asKiroraError(error)
+        }
     }
 
     /// Call before your own sign-out. Tries to send queued events, detaches this device from
@@ -146,41 +175,58 @@ public final class Kirora: @unchecked Sendable {
         // user back after this logout. Whoever is signed in is signed out as usual.
         if !signInSettled { identity.abandonPendingSignIn() }
         guard let user = identity.user else { return }
+        // Nothing tracked from now on joins the outgoing user, or their visit: it waits for
+        // the next one.
+        identity.beginSignOut(user)
+        tracker.endSession(ownedBy: user.subject)
         // Past the deadline, the user is forgotten all the same, and a detachment still under
         // way carries on in the background, behind any registration it must follow.
         let delivery = self.delivery, push = self.push
         let sendAndDetach = Task {
             // Independent: the detachment waits only for registrations, not for events.
             async let sent: Void = delivery.flush()
-            await push.detach(user)
+            await push.detach(user, deadline: deadline)
             await sent
         }
         let remaining = deadline.timeIntervalSinceNow
-        if remaining > 0 { _ = try? await withTimeout(seconds: remaining) { await sendAndDetach.value } }
-        // Anything left belongs to this user, so don't send it as the next one. Events from
-        // before sign-in go too, unless the next user is already signed in to send them;
-        // and if that's this user again, nothing of theirs goes.
-        if identity.signOut(user) {
-            queue.clear(owner: user.subject)
-            appOpens.clear(owner: user.subject)
-        } else if identity.user?.subject != user.subject {
-            queue.clearOwned { owner, _ in owner == user.subject }
-            appOpens.clear(owner: user.subject)
+        var finished = false
+        if remaining > 0 {
+            finished = (try? await withTimeout(seconds: remaining) { await sendAndDetach.value }) != nil
         }
+        // Out of time: a send still under way is cancelled (its events go with the user). The
+        // detachment's own request is cancelled at the same deadline, then retried.
+        if !finished { await delivery.cancel(sendingAs: user) }
+        let signedOut = identity.signOut(user)
+        // Anything left is this user's, so it never goes as the next one; but if they
+        // signed in again meanwhile, it's theirs to send.
+        if identity.user?.subject != user.subject {
+            tracker.forgetEvents(ownedBy: user.subject)
+            appOpens.clear(owner: user.subject)
+            forgetPushConsent(unlessOf: identity.user?.subject)
+        }
+        if signedOut { tracker.endSession(ownedBy: user.subject) }
+        adoption.withLock { if $0?.user === user { $0 = nil } }
     }
 
     /// Queues an event, with a copy of `properties` as they are now. Returns at once and
     /// never throws: an event Kirora refuses is logged, and the rest still go through.
     ///
-    /// Properties must be JSON: strings, numbers, booleans, `nil`/`NSNull`, arrays and
-    /// dictionaries of them. Dates are sent as ISO 8601 strings, URLs and UUIDs as strings;
-    /// anything else is left out and logged.
+    /// Properties must be JSON: strings, finite numbers, booleans, `NSNull`, arrays and
+    /// dictionaries of them. A `nil` member is left out; dates are sent as ISO 8601 strings,
+    /// URLs and UUIDs as strings. An event holding anything else is dropped and logged.
     public func track(_ name: String, properties: [String: Any] = [:]) {
         guard !destroyed else { return }
-        var dropped: [String] = []
-        let converted = JSONValue.fromObject(properties, dropped: &dropped)
-        if !dropped.isEmpty {
-            log.error("\(name): left out properties JSON can't hold: \(dropped.sorted().joined(separator: ", "))")
+        guard !name.isEmpty else {
+            log.error("Not tracked: an event needs a name")
+            return
+        }
+        let converted: [String: JSONValue]
+        do {
+            converted = try JSONValue.fromObject(properties)
+        } catch {
+            // The kind of problem only: properties may hold what the app keeps private.
+            log.error("\(name) not tracked: its properties hold \(error)")
+            return
         }
         tracker.track(name, properties: converted)
     }
@@ -199,6 +245,9 @@ public final class Kirora: @unchecked Sendable {
         let newlyAllowed = consent.answer(granted)
         if !granted {
             tracker.forget()
+            appOpens.forget()
+            let delivery = self.delivery
+            Task { await delivery.cancelIfDisallowed() }
             releaseDeviceId.ifUnneeded(registered: push.registered)
         }
         guard newlyAllowed, !destroyed else { return }
@@ -215,12 +264,79 @@ public final class Kirora: @unchecked Sendable {
         await push.requestPermission()
     }
 
+    /// This device's push, for an app's "notifications on/off" setting. Never prompts, and
+    /// waits for a sign-in under way. The permission comes first (``PushStatus/denied``,
+    /// ``PushStatus/unanswered``, ``PushStatus/unsupported``); with it granted,
+    /// ``PushStatus/enabled`` when this device is registered for the signed-in user, and
+    /// ``PushStatus/disabled`` otherwise: turned off, signed out, or the registration failed.
+    public func getPushStatus() async -> PushStatus {
+        await identity.settled()
+        guard !destroyed else { return push.enabled ? .disabled : .unsupported }
+        return await push.status()
+    }
+
+    /// This device's own push on/off, kept on the device for whoever signs in next too, as
+    /// opposed to the user's marketing consent (``setPushConsent(_:)``). `false` detaches
+    /// the device from the signed-in user's pushes (retried in the background as
+    /// ``logout()``'s is), and while it holds, ``identify(_:)`` doesn't register the device.
+    /// `true` registers it again if notifications are already allowed, never prompting; so
+    /// does ``requestPushPermission()`` answered ``PushPermission/granted``. Never fails.
+    public func setPushEnabled(_ enabled: Bool) async {
+        guard !destroyed else { return }
+        await identity.settled()
+        await push.setEnabled(enabled)
+    }
+
     /// Records the user's consent to marketing pushes, as your app asked them. The
     /// notification permission alone doesn't grant it.
+    ///
+    /// - Throws: A ``KiroraError`` when Kirora hasn't recorded the choice: ``KiroraApiError``
+    ///   for its refusal or a server error, ``UserTokenError``, or ``KiroraError`` itself when
+    ///   it couldn't be reached or nobody is signed in. Ask again later.
     public func setPushConsent(_ granted: Bool) async throws {
         await identity.settled()
         guard !destroyed else { return }
-        try await api.request("PUT", "/push-consent", body: JSONValue.object(["granted": .bool(granted)]))
+        let user = identity.user
+        do {
+            try await api.request("PUT", "/push-consent", body: JSONValue.object(["granted": .bool(granted)]))
+        } catch {
+            throw asKiroraError(error)
+        }
+        // The user's choice, for getState(): kept only while they're the one signed in.
+        if let user, identity.user?.subject == user.subject {
+            store.setJSON(RecordedPushConsent(user: user.subject, granted: granted), for: StorageKeys.pushConsent)
+        }
+    }
+
+    /// The signed-in user's last recorded marketing push choice, or nil.
+    private var recordedPushConsent: RecordedPushConsent? {
+        guard let record = store.json(RecordedPushConsent.self, StorageKeys.pushConsent),
+              record.user == identity.user?.subject
+        else { return nil }
+        return record
+    }
+
+    /// Forgets the recorded push choice unless it's `subject`'s.
+    private func forgetPushConsent(unlessOf subject: String?) {
+        guard let record = store.json(RecordedPushConsent.self, StorageKeys.pushConsent),
+              record.user != subject
+        else { return }
+        store.set(nil, for: StorageKeys.pushConsent)
+    }
+
+    /// A snapshot of the client, for your app's support and debug screens. Read-only and
+    /// never sent anywhere: it never prompts, makes no network call and never fails.
+    public func getState() -> KiroraState {
+        KiroraState(
+            isInitialized: !destroyed,
+            isIdentified: identity.user != nil,
+            deviceId: deviceId.existing,
+            sessionId: tracker.currentSessionId,
+            pushToken: push.registeredToken,
+            trackingConsent: consent.allowed,
+            pushConsent: recordedPushConsent?.granted ?? false,
+            queuedEventCount: queue.count
+        )
     }
 
     /// Sends queued events now; rarely needed. Returning doesn't mean all were accepted:
@@ -251,9 +367,18 @@ public final class Kirora: @unchecked Sendable {
 
     private var destroyed: Bool { destroyedFlag.current }
 
+
     /// Once signed in: send what waits, and register this device for push.
     private func onSignedIn() async throws {
         let user = identity.user
+        // What was tracked before sign-in is this user's from now on, whoever signs in next,
+        // unless Kirora refuses their token before accepting it once.
+        if let user {
+            // A choice recorded for someone else isn't this user's.
+            forgetPushConsent(unlessOf: user.subject)
+            let keys = queue.adopt(user.subject)
+            adoption.withLock { $0 = keys.isEmpty || user.confirmed ? nil : (user, keys) }
+        }
         // Events left by earlier sign-ins with tokens naming no one: they'd otherwise wait for
         // good. Only once they're old, as another client may still be signed in to send them.
         let staleBefore = now().addingTimeInterval(-24 * 60 * 60)
@@ -327,6 +452,8 @@ struct DeviceIdRelease: Sendable {
 struct KiroraEnvironment {
     var transport: HTTPTransport
     var store: KeyValueStore
+    /// The second copy of a tracking refusal: a store nothing else writes.
+    var refusals: KeyValueStore
     var eventsFile: (String) -> PersistentFile
     var lifecycle: AppLifecycleSource
     var pushPlatform: PushPlatform
@@ -346,6 +473,7 @@ struct KiroraEnvironment {
         let lifecycle: AppLifecycleSource = UIKitLifecycle()
         let platform: PushPlatform = UIKitPushPlatform()
         let installPushIntegration: (Log) -> Void = { PushIntegration.install(log: $0) }
+        readDeviceScreen()
         #else
         let lifecycle: AppLifecycleSource = NoLifecycle()
         let platform: PushPlatform = UnsupportedPushPlatform()
@@ -353,7 +481,8 @@ struct KiroraEnvironment {
         #endif
         return KiroraEnvironment(
             transport: URLSessionTransport(),
-            store: FileKeyValueStore(file: PersistentFile(url: directory.appendingPathComponent("state.json"), onError: onError)),
+            store: FileKeyValueStore.shared(file: PersistentFile(url: directory.appendingPathComponent("state.json"), onError: onError)),
+            refusals: FileKeyValueStore.shared(file: PersistentFile(url: directory.appendingPathComponent("consent.json"), onError: onError)),
             eventsFile: { namespace in
                 PersistentFile(url: directory.appendingPathComponent("events-\(fileSafe(namespace)).json"), onError: onError)
             },
@@ -368,6 +497,7 @@ struct KiroraEnvironment {
         )
     }
 }
+
 
 /// Where push isn't available.
 struct UnsupportedPushPlatform: PushPlatform {

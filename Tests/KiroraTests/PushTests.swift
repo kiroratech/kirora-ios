@@ -23,7 +23,7 @@ struct PushRegistrationTests {
         let pushApp = try #require(app.server.requests("GET", "/client/v1/push-app").first)
         #expect(pushApp.query == ["platform": "ios"])
         let put = try #require(app.server.requests.first { $0.method == "PUT" && $0.path.hasPrefix(devicePrefix) })
-        #expect(put.path == devicePrefix + app.store.string(StorageKeys.deviceId)!)
+        #expect(put.path == devicePrefix + app.stored(StorageKeys.deviceId)!)
         #expect(put.body == .object([
             "pushAppId": .string(FakeKirora.pushAppId), "targetKind": .string("apns_token"),
             "permission": .string("granted"), "target": .string("abcd01"),
@@ -60,6 +60,21 @@ struct PushRegistrationTests {
         app.clock.advance(25 * 60 * 60)
         try await app.start(push: .enabled).identify(userToken("user-1"))
         #expect(app.server.requests.filter { $0.method == "PUT" }.count == 2)
+    }
+
+    @Test func aNewTimeZoneOrLanguageWaitsForTheDailyRefresh() async throws {
+        let app = TestApp()
+        try await app.start(push: .enabled).identify(userToken("user-1"))
+        app.deviceInfo.timezone = { "Europe/London" }
+        app.deviceInfo.locale = { "fr-FR" }
+        try await app.start(push: .enabled).identify(userToken("user-1"))
+        #expect(app.server.requests.filter { $0.method == "PUT" }.count == 1)
+        app.clock.advance(25 * 60 * 60)
+        try await app.start(push: .enabled).identify(userToken("user-1"))
+        let puts = app.server.requests.filter { $0.method == "PUT" }
+        #expect(puts.count == 2)
+        #expect(puts.last?.body?["timezone"] == .string("Europe/London"))
+        #expect(puts.last?.body?["locale"] == .string("fr-FR"))
     }
 
     @Test func registersAgainForANewUserOrToken() async throws {
@@ -122,7 +137,7 @@ struct PushRegistrationTests {
         try await kirora.identify(userToken("user-1"))
         await kirora.logout()
         let delete = try #require(app.server.requests.first { $0.method == "DELETE" })
-        #expect(delete.path == devicePrefix + app.store.string(StorageKeys.deviceId)!)
+        #expect(delete.path == devicePrefix + app.stored(StorageKeys.deviceId)!)
         #expect(delete.token == userToken("user-1"))
     }
 
@@ -159,8 +174,27 @@ struct PushRegistrationTests {
         await kirora.flush()
         await settle()
         #expect(!app.server.sentEventNames.contains("After Logout"))
-        // The detachment carried on in the background.
-        #expect(app.server.requests.filter { $0.method == "DELETE" }.count == 1)
+        // The request still under way at the deadline was cancelled, and the detachment
+        // carries on in the background.
+        #expect(app.server.requests.filter { $0.method == "DELETE" }.count >= 2)
+    }
+
+    @Test func logoutCancelsASendStillUnderWayAtItsDeadline() async throws {
+        let app = TestApp()
+        app.logoutWait = 0.2
+        let kirora = app.start(trackSessions: false)
+        try await kirora.identify(userToken("user-1"))
+        app.server.answer { request in
+            guard request.path == "/client/v1/events/batch" else { return nil }
+            return FakeAnswer(status: 200, body: nil, delay: 1)
+        }
+        kirora.track("Slow")
+        let started = Date()
+        await kirora.logout()
+        #expect(Date().timeIntervalSince(started) < 0.6)
+        // The slow answer never lands: the request was cancelled.
+        await settle(1.2)
+        #expect(app.server.completedRequests.filter { $0.path == "/client/v1/events/batch" }.isEmpty)
     }
 
     @Test func logoutsDeadlineIncludesASignInStillWaitingForItsToken() async throws {
@@ -211,16 +245,25 @@ struct PushRegistrationTests {
         #expect(app.server.requests.filter { $0.method == "DELETE" }.count == 1)
     }
 
-    @Test func aSignInStopsTheDetachRetries() async throws {
+    @Test func aNewUsersRegistrationLeavesTheCleanupToKirora() async throws {
         let app = TestApp()
         let kirora = app.start(push: .enabled)
         try await kirora.identify(userToken("user-1"))
-        app.server.answer { $0.method == "DELETE" ? .networkError : nil }
+        let online = Locked(false)
+        app.server.answer { $0.method == "DELETE" && !online.current ? .networkError : nil }
         await kirora.logout()
         try await kirora.identify(userToken("user-2"))
-        let deletes = app.server.requests.filter { $0.method == "DELETE" }.count
+        // The device doesn't cancel it: user-1's detachment carries on, as user-1.
+        let before = app.server.requests.filter { $0.method == "DELETE" }.count
+        #expect(await eventually { app.server.requests.filter { $0.method == "DELETE" }.count > before })
+        #expect(app.server.requests.filter { $0.method == "DELETE" }.allSatisfy { subjectOf($0.token ?? "") == "user-1" })
+        // Kirora scopes it to user-1, so it's harmless once it lands: the device stays user-2's.
+        online.withLock { $0 = true }
         await settle(0.4)
-        #expect(app.server.requests.filter { $0.method == "DELETE" }.count == deletes)
+        let landed = app.server.requests.filter { $0.method == "DELETE" }.count
+        await settle(0.3)
+        #expect(app.server.requests.filter { $0.method == "DELETE" }.count == landed)
+        #expect(await kirora.getPushStatus() == .enabled)
     }
 
     @Test func logoutDetachesOnlyTheUsersOwnRegistration() async throws {
@@ -236,6 +279,9 @@ struct PushRegistrationTests {
 
     @Test func aNewUserWithNotificationsOffTakesTheDeviceOver() async throws {
         let app = TestApp()
+        // Known before the client starts, so registering doesn't also start a background
+        // registration for a "new" token that could report the denial as user-1.
+        app.tokens.received(Data([0xAB, 0xCD, 0x01]))
         let kirora = app.start(push: .enabled)
         try await kirora.identify(userToken("user-1"))
         app.push.status.withLock { $0 = .denied }
@@ -307,7 +353,7 @@ struct AppOpenTests {
         #expect(await eventually { appOpens(app).count == 1 })
         let open = appOpens(app)[0]
         #expect(open.body == .object(["occurredAt": .string(isoTimestamp(app.clock.now)), "pushAppId": .string(FakeKirora.pushAppId)]))
-        #expect(open.path == devicePrefix + app.store.string(StorageKeys.deviceId)! + "/app-opens")
+        #expect(open.path == devicePrefix + app.stored(StorageKeys.deviceId)! + "/app-opens")
     }
 
     @Test func goAgainOnlyAfter30Minutes() async throws {
@@ -388,7 +434,8 @@ struct PushReportTests {
         let opened = Locked<[URL]>([])
         let handler = PushTapHandler(transport: server, openURL: { url in opened.withLock { $0.append(url) } })
         let payload = KiroraPushPayload(userInfo: [
-            "aps": ["alert": "Hi"], "trackingUrl": "https://api.test.kirora.io/t/p/abc", "actionUrl": "myapp://orders/1",
+            "aps": ["alert": "Hi"], "kirora": "true", "trackingUrl": "https://api.test.kirora.io/t/p/abc",
+            "actionUrl": "myapp://orders/1",
         ])!
         await handler.handle(payload, action: .open)
         #expect(opened.current == [URL(string: "myapp://orders/1")!])
@@ -399,7 +446,7 @@ struct PushReportTests {
     @Test func aTapWithoutALinkIsAnOpen() async {
         let server = FakeKirora()
         let handler = PushTapHandler(transport: server, openURL: { _ in })
-        await handler.handle(KiroraPushPayload(userInfo: ["trackingUrl": "https://api.test.kirora.io/t/p/abc"])!, action: .open)
+        await handler.handle(KiroraPushPayload(userInfo: ["kirora": "true", "trackingUrl": "https://api.test.kirora.io/t/p/abc"])!, action: .open)
         #expect(server.requests.first?.body == .object(["event": .string("opened")]))
     }
 
@@ -411,12 +458,14 @@ struct PushReportTests {
         #expect(KiroraPushPayload(userInfo: ["aps": ["alert": "Someone else's"]]) == nil)
     }
 
-    @Test func onlyAMarkedPushOrKirorasTrackingPathIsKiroras() {
+    @Test func onlyAMarkedPushIsKiroras() {
         // Another provider's push using the same generic names.
         #expect(KiroraPushPayload(userInfo: ["actionUrl": "https://other.example/promo"]) == nil)
         #expect(KiroraPushPayload(userInfo: ["trackingUrl": "https://other.example/track"]) == nil)
         #expect(KiroraPushPayload(userInfo: ["kirora": "true"]) != nil)
-        #expect(KiroraPushPayload(userInfo: ["trackingUrl": "https://api.kirora.io/t/p/abc"]) != nil)
+        // Not even one with Kirora's tracking path: the marker alone decides.
+        #expect(KiroraPushPayload(userInfo: ["trackingUrl": "https://api.kirora.io/t/p/abc"]) == nil)
+        #expect(KiroraNotificationService.kiroraPush(["trackingUrl": "https://api.kirora.io/t/p/abc"]) == nil)
         // Links Kirora would never send aren't opened.
         let unsafe = KiroraPushPayload(userInfo: ["kirora": "true", "actionUrl": "javascript:alert(1)"])
         #expect(unsafe?.actionUrl == nil)

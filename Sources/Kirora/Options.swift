@@ -39,6 +39,14 @@ public struct KiroraOptions: Sendable {
     /// (through your scene or app delegate), anything else with `UIApplication.open`.
     public var handleDeepLink: (@MainActor @Sendable (URL) -> Bool)?
 
+    /// Redacts or drops an event before it's stored or sent. Called once per event,
+    /// automatic ones included (`Session Started`, screen views, lifecycle events), on the
+    /// thread that tracked it, with a copy of its name, properties and context. Return the
+    /// event with fields changed or removed, or `nil` to drop it. Throwing, or answering
+    /// values JSON can't hold, drops the event too. The name, time and idempotency key stay
+    /// the SDK's. Tracking from inside it is refused.
+    public var beforeSend: (@Sendable (BeforeSendEvent) throws -> BeforeSendEvent?)?
+
     /// Kirora's address, for staging or a private deployment, without a path: the SDK
     /// adds its own. Defaults to `https://api.kirora.io`.
     public var apiUrl: String
@@ -52,8 +60,10 @@ public struct KiroraOptions: Sendable {
         trackAppLifecycle: Bool = false,
         logLevel: LogLevel = .error,
         handleDeepLink: (@MainActor @Sendable (URL) -> Bool)? = nil,
-        apiUrl: String = "https://api.kirora.io"
+        apiUrl: String = "https://api.kirora.io",
+        beforeSend: (@Sendable (BeforeSendEvent) throws -> BeforeSendEvent?)? = nil
     ) {
+        self.beforeSend = beforeSend
         self.handleDeepLink = handleDeepLink
         self.clientKey = clientKey
         self.fetchUserToken = fetchUserToken
@@ -89,6 +99,62 @@ public enum PushPermission: String, Sendable, Equatable {
     case unanswered
     /// Push is off in ``KiroraOptions/push``, or the platform can't take pushes.
     case unsupported
+}
+
+/// The answer to ``Kirora/getPushStatus()``. The same values in every Kirora SDK. The
+/// notification permission comes first; with it granted, ``enabled`` when this device is
+/// registered for the signed-in user.
+public enum PushStatus: String, Sendable, Equatable {
+    /// Registered for the signed-in user's pushes.
+    case enabled
+    /// Permission is granted, but the device isn't registered: turned off with
+    /// ``Kirora/setPushEnabled(_:)``, nobody signed in, or the registration failed.
+    case disabled
+    case denied
+    /// The user hasn't answered the notification prompt yet.
+    case unanswered
+    /// Push is off in ``KiroraOptions/push``, or the platform can't take pushes.
+    case unsupported
+}
+
+/// What ``Kirora/getState()`` answers: a snapshot for an app's support and debug screens.
+public struct KiroraState: Sendable, Equatable {
+    /// The client is set up and not destroyed.
+    public let isInitialized: Bool
+    /// A user is signed in.
+    public let isIdentified: Bool
+    /// The id sent as `context.device.id`, or nil when there is none (deleted after tracking
+    /// consent was withdrawn, say, or not made yet).
+    public let deviceId: String?
+    /// The current visit's id, or nil when there is none.
+    public let sessionId: String?
+    /// The token this device is registered for push with: the APNs token as lowercase hex,
+    /// or the Firebase token for an app that sends through Firebase. Nil while unregistered.
+    public let pushToken: String?
+    /// Whether behavioural tracking is allowed now.
+    public let trackingConsent: Bool
+    /// The signed-in user's last marketing push choice recorded from this device with
+    /// ``Kirora/setPushConsent(_:)``; false if there is none. Cleared at logout and when
+    /// another user signs in.
+    public let pushConsent: Bool
+    /// Events waiting on the device.
+    public let queuedEventCount: Int
+}
+
+/// An event as ``KiroraOptions/beforeSend`` sees it: a copy, so changing it changes nothing
+/// else. Values are Foundation's JSON values: `String`, `Int64`, `Double`, `Bool`, `NSNull`,
+/// arrays and `[String: Any]`.
+public struct BeforeSendEvent: @unchecked Sendable {
+    public let name: String
+    public var properties: [String: Any]
+    /// The session, device, language and time zone the SDK collected.
+    public var context: [String: Any]
+
+    public init(name: String, properties: [String: Any], context: [String: Any]) {
+        self.name = name
+        self.properties = properties
+        self.context = context
+    }
 }
 
 /// What the SDK logs.

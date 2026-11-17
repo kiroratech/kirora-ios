@@ -19,13 +19,13 @@ struct DeliveryTests {
             "order_id": .string("1042"), "total": .double(46.5), "items": .int(2), "gift": .bool(false),
         ]))
         let context = try #require(event["context"])
-        #expect(context["device"]?["id"]?.stringValue == app.store.string(StorageKeys.deviceId))
+        #expect(context["device"]?["id"]?.stringValue == app.stored(StorageKeys.deviceId))
         #expect(context["locale"] == .string("en-GB"))
         #expect(context["timezone"] == .string("Africa/Lagos"))
         #expect(context["sessionId"]?.stringValue != nil)
         // Only the fields Kirora's context takes.
         if case .object(let fields) = context {
-            #expect(Set(fields.keys).isSubset(of: ["sessionId", "device", "locale", "timezone"]))
+            #expect(Set(fields.keys).isSubset(of: ["app", "os", "screen", "device", "sessionId", "locale", "timezone"]))
         }
     }
 
@@ -75,7 +75,7 @@ struct DeliveryTests {
             let results = request.events.map { event -> JSONValue in
                 event["name"] == .string("contact.bad")
                     ? .object(["idempotencyKey": event["idempotencyKey"]!, "error": .object(["code": .string("VALIDATION_ERROR")])])
-                    : .object(["idempotencyKey": event["idempotencyKey"]!, "replayed": .bool(false)])
+                    : .object(["idempotencyKey": event["idempotencyKey"]!, "replayed": .bool(false), "event": recordedEvent])
             }
             return .ok(.object(["results": .array(results)]))
         }
@@ -227,15 +227,14 @@ struct DeliveryTests {
 
 @Suite("Properties")
 struct PropertyTests {
-    @Test func convertsWhatJSONCanHold() {
-        var dropped: [String] = []
+    @Test func convertsWhatJSONCanHold() throws {
         let date = Date(timeIntervalSince1970: 0)
-        let value = JSONValue.fromObject([
+        let value = try JSONValue.fromObject([
             "string": "a", "int": 3, "double": 1.5, "bool": true, "null": NSNull(),
             "date": date, "url": URL(string: "https://kirora.io")!,
             "nested": ["list": [1, "two", Optional<Int>.none as Any]],
-            "nan": Double.nan, "object": NSObject(),
-        ], dropped: &dropped)
+            "absent": Optional<String>.none as Any,
+        ])
         #expect(value["string"] == .string("a"))
         #expect(value["int"] == .int(3))
         #expect(value["double"] == .double(1.5))
@@ -243,17 +242,26 @@ struct PropertyTests {
         #expect(value["null"] == .null)
         #expect(value["date"] == .string("1970-01-01T00:00:00.000Z"))
         #expect(value["url"] == .string("https://kirora.io"))
+        // In an array, nil is null; as a member, it's left out, as Swift's JSON encoder does.
         #expect(value["nested"] == .object(["list": .array([.int(1), .string("two"), .null])]))
-        #expect(value["nan"] == .null)
-        #expect(value["object"] == nil)
-        #expect(dropped == ["object"])
+        #expect(value.keys.contains("absent") == false)
     }
 
-    @Test func tellsBooleansFromNumbers() {
-        var dropped: [String] = []
-        #expect(JSONValue.from(NSNumber(value: true), dropped: &dropped) == .bool(true))
-        #expect(JSONValue.from(NSNumber(value: 1), dropped: &dropped) == .int(1))
-        #expect(JSONValue.from(NSNumber(value: 2.5), dropped: &dropped) == .double(2.5))
+    @Test func refusesWhatJSONCantHoldFaithfully() {
+        #expect(throws: JSONValue.Unrepresentable.self) { try JSONValue.fromObject(["nan": Double.nan]) }
+        #expect(throws: JSONValue.Unrepresentable.self) { try JSONValue.fromObject(["inf": Double.infinity]) }
+        #expect(throws: JSONValue.Unrepresentable.self) { try JSONValue.fromObject(["object": NSObject()]) }
+        #expect(throws: JSONValue.Unrepresentable.self) { try JSONValue.fromObject(["keys": [1: "a"] as [AnyHashable: Any]]) }
+        // An array that holds itself.
+        let circular = NSMutableArray()
+        circular.add(circular)
+        #expect(throws: JSONValue.Unrepresentable.self) { try JSONValue.fromObject(["loop": circular]) }
+    }
+
+    @Test func tellsBooleansFromNumbers() throws {
+        #expect(try JSONValue.from(NSNumber(value: true)) == .bool(true))
+        #expect(try JSONValue.from(NSNumber(value: 1)) == .int(1))
+        #expect(try JSONValue.from(NSNumber(value: 2.5)) == .double(2.5))
     }
 
     @Test func sleepingNeverTrapsOnAnyValue() async {

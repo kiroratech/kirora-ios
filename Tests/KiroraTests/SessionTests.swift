@@ -111,10 +111,10 @@ struct SessionTests {
         let app = TestApp()
         let kirora = app.start()
         kirora.track("One")
-        let id = try #require(app.store.string(StorageKeys.deviceId))
+        let id = try #require(app.stored(StorageKeys.deviceId))
         #expect(UUID(uuidString: id) != nil)
         app.start().track("Two")
-        #expect(app.store.string(StorageKeys.deviceId) == id)
+        #expect(app.stored(StorageKeys.deviceId) == id)
     }
 }
 
@@ -128,8 +128,8 @@ struct ConsentTests {
         try await kirora.identify(userToken("user-1"))
         await kirora.flush()
         #expect(app.server.batches.isEmpty)
-        #expect(app.store.string(StorageKeys.deviceId) == nil)
-        #expect(app.store.string(StorageKeys.session) == nil)
+        #expect(app.stored(StorageKeys.deviceId) == nil)
+        #expect(app.stored(StorageKeys.session) == nil)
 
         kirora.setTrackingConsent(true)
         kirora.track("After Consent")
@@ -150,7 +150,7 @@ struct ConsentTests {
         #expect(app.store.keys.isEmpty)
         // Withdrawing keeps only the answer itself.
         kirora.setTrackingConsent(false)
-        #expect(app.store.keys == [StorageKeys.trackingConsent])
+        #expect(app.store.keys == [app.scopedKey(StorageKeys.trackingConsent)])
     }
 
     @Test func consentIsRememberedOnTheDevice() async throws {
@@ -172,6 +172,6 @@ struct ConsentTests {
         try await kirora.identify(userToken("user-1"))
         await kirora.flush()
         #expect(app.server.batches.isEmpty)
-        #expect(app.store.string(StorageKeys.deviceId) == nil)
+        #expect(app.stored(StorageKeys.deviceId) == nil)
     }
 }

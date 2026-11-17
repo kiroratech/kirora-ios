@@ -53,10 +53,22 @@ enum JSONValue: Sendable, Equatable, Codable {
         return nil
     }
 
-    /// Converts what the app passed. Values JSON can't hold are left out and named in
-    /// `dropped`, as the web SDK's `JSON.stringify` leaves them out; dates become ISO 8601
-    /// strings, and numbers that aren't finite become null, as there.
-    static func from(_ value: Any, path: String = "", dropped: inout [String]) -> JSONValue? {
+    /// Why a value can't be sent faithfully as JSON. Names the kind of problem only, never
+    /// the value or where it was: properties may hold what the app wants kept private.
+    struct Unrepresentable: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// Nesting past this is taken for a value that holds itself (an `NSMutableArray` added
+    /// to itself), which would otherwise recurse until the app crashed.
+    static let maxDepth = 64
+
+    /// Converts what the app passed, or throws if any of it can't be sent faithfully as
+    /// JSON, so the whole event is dropped rather than sent changed. As Swift's own JSON
+    /// encoder writes them: a `nil` member of a dictionary is left out (`NSNull` is null), a
+    /// `nil` in an array is null, URLs and UUIDs are strings; and dates are ISO 8601 strings.
+    static func from(_ value: Any, depth: Int = 0) throws -> JSONValue {
+        guard depth <= maxDepth else { throw Unrepresentable(description: "nested too deeply, or holds itself") }
         guard let unwrapped = unwrapOptional(value) else { return .null }
         switch unwrapped {
         case is NSNull:
@@ -70,7 +82,7 @@ enum JSONValue: Sendable, Equatable, Codable {
         case let value as Bool:
             // `NSNumber` bridges to `Bool` too, so only a real boolean lands here first.
             if let number = unwrapped as? NSNumber, !isBoolean(number) {
-                return fromNumber(number)
+                return try fromNumber(number)
             }
             return .bool(value)
         case let value as Int: return .int(Int64(value))
@@ -81,65 +93,70 @@ enum JSONValue: Sendable, Equatable, Codable {
         case let value as UInt8: return .int(Int64(value))
         case let value as UInt16: return .int(Int64(value))
         case let value as UInt32: return .int(Int64(value))
-        case let value as UInt: return value <= UInt(Int64.max) ? .int(Int64(value)) : .double(Double(value))
-        case let value as UInt64: return value <= UInt64(Int64.max) ? .int(Int64(value)) : .double(Double(value))
-        case let value as Double: return finite(value)
-        case let value as Float: return finite(Double(value))
-        case let value as Decimal: return finite(NSDecimalNumber(decimal: value).doubleValue)
-        case let value as NSNumber: return fromNumber(value)
+        case let value as UInt: return value <= UInt(Int64.max) ? .int(Int64(value)) : try finite(Double(value))
+        case let value as UInt64: return value <= UInt64(Int64.max) ? .int(Int64(value)) : try finite(Double(value))
+        case let value as Double: return try finite(value)
+        case let value as Float: return try finite(Double(value))
+        case let value as Decimal: return try finite(NSDecimalNumber(decimal: value).doubleValue)
+        case let value as NSNumber: return try fromNumber(value)
         case let value as Date: return .string(isoTimestamp(value))
         case let value as URL: return .string(value.absoluteString)
         case let value as UUID: return .string(value.uuidString.lowercased())
         case let value as JSONValue: return value
         case let value as [Any]:
-            var items: [JSONValue] = []
-            for (index, item) in value.enumerated() {
-                // In an array, JSON.stringify writes null for what it can't hold.
-                items.append(from(item, path: "\(path)[\(index)]", dropped: &dropped) ?? .null)
-            }
-            return .array(items)
+            return .array(try value.map { try from($0, depth: depth + 1) })
         case let value as [String: Any]:
-            return .object(fromObject(value, path: path, dropped: &dropped))
+            return .object(try fromObject(value, depth: depth + 1))
         case let value as [AnyHashable: Any]:
             var object: [String: Any] = [:]
             for (key, item) in value {
                 guard let key = key.base as? String else {
-                    dropped.append(path.isEmpty ? "\(key)" : "\(path).\(key)")
-                    continue
+                    throw Unrepresentable(description: "a dictionary key that isn't a string")
                 }
                 object[key] = item
             }
-            return .object(fromObject(object, path: path, dropped: &dropped))
+            return .object(try fromObject(object, depth: depth + 1))
         default:
-            dropped.append(path.isEmpty ? "(value)" : path)
-            return nil
+            throw Unrepresentable(description: "a value of a type JSON can't hold")
         }
     }
 
-    static func fromObject(
-        _ object: [String: Any], path: String = "", dropped: inout [String]
-    ) -> [String: JSONValue] {
+    static func fromObject(_ object: [String: Any], depth: Int = 0) throws -> [String: JSONValue] {
         var result: [String: JSONValue] = [:]
         for (key, item) in object {
-            let itemPath = path.isEmpty ? key : "\(path).\(key)"
-            if let converted = from(item, path: itemPath, dropped: &dropped) {
-                result[key] = converted
-            }
+            // A `nil` member is absent, as Swift's JSON encoder leaves it out.
+            if unwrapOptional(item) == nil { continue }
+            result[key] = try from(item, depth: depth)
         }
         return result
     }
 
-    private static func finite(_ value: Double) -> JSONValue {
-        value.isFinite ? .double(value) : .null
+    /// As Foundation values (`NSNull` for null), for the app's `beforeSend`: a copy of its
+    /// own, so changing it changes nothing the SDK holds.
+    var foundationValue: Any {
+        switch self {
+        case .null: return NSNull()
+        case .bool(let value): return value
+        case .int(let value): return value
+        case .double(let value): return value
+        case .string(let value): return value
+        case .array(let value): return value.map(\.foundationValue)
+        case .object(let value): return value.mapValues(\.foundationValue)
+        }
     }
 
-    private static func fromNumber(_ number: NSNumber) -> JSONValue {
+    private static func finite(_ value: Double) throws -> JSONValue {
+        guard value.isFinite else { throw Unrepresentable(description: "a number that isn't finite") }
+        return .double(value)
+    }
+
+    private static func fromNumber(_ number: NSNumber) throws -> JSONValue {
         if isBoolean(number) { return .bool(number.boolValue) }
         let type = String(cString: number.objCType)
         if ["c", "s", "i", "l", "q", "C", "S", "I", "L", "Q"].contains(type) {
             return .int(number.int64Value)
         }
-        return finite(number.doubleValue)
+        return try finite(number.doubleValue)
     }
 
     private static func isBoolean(_ number: NSNumber) -> Bool {

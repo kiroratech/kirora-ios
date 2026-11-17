@@ -15,8 +15,22 @@ final class UIKitLifecycle: AppLifecycleSource, @unchecked Sendable {
     private var handler: (@Sendable (LifecycleEvent) -> Void)?
 
     func start(_ handler: @escaping @Sendable (LifecycleEvent) -> Void) {
+        // Handled off the main thread, in order: handling may wait for the files' first read,
+        // and UIKit calls from the main thread, at launch too. Going to the background, with
+        // time from iOS to finish.
+        let deliver: @Sendable (LifecycleEvent) -> Void = { event in
+            guard event == .background else { return lifecycleQueue.async { handler(event) } }
+            runWithBackgroundTime("Kirora background") {
+                await withCheckedContinuation { done in
+                    lifecycleQueue.async {
+                        handler(event)
+                        done.resume()
+                    }
+                }
+            }
+        }
         onMain { [self] in
-            self.handler = handler
+            self.handler = deliver
             let center = NotificationCenter.default
             observers.append(center.addObserver(
                 forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
@@ -76,6 +90,22 @@ final class UIKitLifecycle: AppLifecycleSource, @unchecked Sendable {
         handler?(.background)
     }
 }
+
+/// Reads the screen for event context, once, on the main thread: its portrait size in
+/// points, which rotation doesn't change, and its scale.
+func readDeviceScreen() {
+    onMain {
+        guard deviceScreen.current == nil else { return }
+        let screen = UIScreen.main
+        let bounds = screen.fixedCoordinateSpace.bounds
+        deviceScreen.withLock {
+            $0 = DeviceInfo.Screen(width: Int(bounds.width), height: Int(bounds.height), density: Double(screen.scale))
+        }
+    }
+}
+
+/// Where every client's lifecycle events are handled: one at a time, in order.
+private let lifecycleQueue = DispatchQueue(label: "io.kirora.sdk.lifecycle", qos: .utility)
 
 /// Runs `work`, asking iOS for time to finish it if the app goes to the background.
 func runWithBackgroundTime(_ name: String, _ work: @escaping @Sendable () async -> Void) {
@@ -169,7 +199,7 @@ enum FirebaseMessagingBridge {
         let selector = NSSelectorFromString("tokenWithCompletion:")
         guard messaging.responds(to: selector) else { return nil }
         // FirebaseMessaging is thread-safe; it's only handed over to be called back.
-        let shared = UncheckedSendable(value: messaging)
+        let shared = UncheckedSendable(messaging)
         return try? await withTimeout(seconds: 10) {
             await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
                 let completion: @convention(block) (NSString?, NSError?) -> Void = { token, _ in
@@ -179,11 +209,6 @@ enum FirebaseMessagingBridge {
             }
         }
     }
-}
-
-/// A value passed across threads that is safe to, though its type doesn't say so.
-struct UncheckedSendable<Value>: @unchecked Sendable {
-    let value: Value
 }
 
 // MARK: - Automatic integration
@@ -234,6 +259,42 @@ enum PushIntegration {
 }
 
 extension PushIntegration {
+    /// Installs the integration at launch, before any client exists, for a wrapper whose
+    /// client is created late, from JavaScript or Dart. iOS hands a tap that launched the app
+    /// to the notification center's delegate as the launch finishes, and only then.
+    ///
+    /// Safe from `+load` (before `UIApplicationMain`), from `didFinishLaunching`, or later: it
+    /// installs now if the app exists, else when it does, at the latest as launching finishes,
+    /// as React Native Firebase's messaging module does. Once, however often it's called.
+    static func installAtLaunch(log: Log) {
+        if Thread.isMainThread, applicationExists() {
+            install(log: log)
+            return
+        }
+        let observer = Locked<NSObjectProtocol?>(nil)
+        observer.withLock { stored in
+            stored = NotificationCenter.default.addObserver(
+                forName: UIApplication.didFinishLaunchingNotification, object: nil, queue: .main
+            ) { _ in
+                if let token = observer.take() { NotificationCenter.default.removeObserver(token) }
+                install(log: log)
+            }
+        }
+        // The main queue first runs inside `UIApplicationMain`, once the app exists: often
+        // before the app's `didFinishLaunching`, never after the notification above.
+        DispatchQueue.main.async {
+            guard applicationExists() else { return }
+            if let token = observer.take() { NotificationCenter.default.removeObserver(token) }
+            install(log: log)
+        }
+    }
+
+    /// Whether `UIApplication.shared` exists yet. Read through the runtime: before
+    /// `UIApplicationMain`, Swift's non-optional `shared` would crash.
+    private static func applicationExists() -> Bool {
+        (UIApplication.self as AnyObject).value(forKey: "sharedApplication") != nil
+    }
+
     /// A new Firebase token registers the device again, for push apps that send through
     /// Firebase. Needs no swizzling, so it's on whether or not the automatic integration is.
     static func observeFirebaseTokens() {
@@ -333,7 +394,7 @@ final class NotificationCenterProxy: NSObject, UNUserNotificationCenterDelegate,
         if appDelegate?.userNotificationCenter?(center, willPresent: notification, withCompletionHandler: completionHandler) != nil {
             return
         }
-        completionHandler(Kirora.foregroundPresentation(for: notification.request.content.userInfo) ?? [])
+        Kirora.presentInForeground(notification.request.content.userInfo, completionHandler)
     }
 
     func userNotificationCenter(
@@ -370,18 +431,14 @@ final class NotificationCenterProxy: NSObject, UNUserNotificationCenterDelegate,
 func openPushLink(_ url: URL, handleDeepLink: (@MainActor @Sendable (URL) -> Bool)?) {
     if handleDeepLink?(url) == true { return }
     let application = UIApplication.shared
+    // A web link the app delegate says it handled (a universal link of its own) stays in
+    // the app. A scene delegate is never handed one: its `scene(_:continue:)` can't say
+    // whether it did, so an external link it ignores would open nothing. A scene-based app
+    // claims its own universal links in `handleDeepLink`; anything unclaimed opens with iOS,
+    // in the browser or the app that owns it.
     if let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
         let activity = NSUserActivity(activityType: NSUserActivityTypeBrowsingWeb)
         activity.webpageURL = url
-        let scenes = application.connectedScenes
-        let scene = scenes.first { $0.activationState == .foregroundActive }
-            ?? scenes.first { $0.activationState == .foregroundInactive }
-            ?? scenes.first
-        if let scene, let delegate = scene.delegate,
-           delegate.responds(to: #selector(UISceneDelegate.scene(_:continue:))) {
-            delegate.scene?(scene, continue: activity)
-            return
-        }
         if application.delegate?.application?(application, continue: activity, restorationHandler: { _ in }) == true {
             return
         }

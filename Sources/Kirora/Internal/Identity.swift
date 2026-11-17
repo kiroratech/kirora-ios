@@ -22,6 +22,11 @@ final class SignedInUser: @unchecked Sendable {
         get { tokenStorage.current }
         set { tokenStorage.withLock { $0 = newValue } }
     }
+
+    private let confirmedFlag = Locked(false)
+    /// Kirora has accepted this user's token at least once.
+    var confirmed: Bool { confirmedFlag.current }
+    func confirm() { confirmedFlag.withLock { $0 = true } }
 }
 
 /// Who is signed in, and every rule for moving from one user to the next:
@@ -39,6 +44,9 @@ final class Identity: @unchecked Sendable {
         var calls = 0
         var signingIn: Task<Void, Error>?
         var pendingRefresh: Task<String, Error>?
+        /// The user `logout()` is signing out: still signed in to send and detach, but new
+        /// events and app opens no longer join them.
+        var leaving: SignedInUser?
     }
 
     private let state = Locked(State())
@@ -51,6 +59,20 @@ final class Identity: @unchecked Sendable {
     }
 
     var user: SignedInUser? { state.withLock { $0.user } }
+
+    /// Who new activity belongs to: the signed-in user, unless they're signing out.
+    var capturingUser: SignedInUser? {
+        state.withLock { state in state.user === state.leaving ? nil : state.user }
+    }
+
+    var capturingSubject: String? { capturingUser?.subject }
+
+    /// `user` is signing out: nothing new joins them from now on.
+    func beginSignOut(_ user: SignedInUser) {
+        state.withLock { state in
+            if state.user === user { state.leaving = user }
+        }
+    }
 
     /// Signs in with `token`, or one from `fetchUserToken`, then runs `onSignedIn`. Does
     /// nothing if a later signIn() or end() has decided who's signed in meanwhile.
@@ -68,6 +90,7 @@ final class Identity: @unchecked Sendable {
                 let current = self.state.withLock { state -> Bool in
                     guard state.calls == call else { return false }
                     state.user = SignedInUser(token: userToken)
+                    state.leaving = nil
                     state.pendingRefresh = nil
                     return true
                 }
@@ -85,6 +108,7 @@ final class Identity: @unchecked Sendable {
         state.withLock { state in
             guard state.user === user else { return false }
             state.user = nil
+            state.leaving = nil
             state.pendingRefresh = nil
             return true
         }
@@ -95,6 +119,7 @@ final class Identity: @unchecked Sendable {
         state.withLock { state in
             state.calls += 1
             state.user = nil
+            state.leaving = nil
             state.pendingRefresh = nil
         }
     }

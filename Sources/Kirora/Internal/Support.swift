@@ -3,7 +3,8 @@ import os.log
 
 /// The version sent in `Kirora-SDK`. Bumped on release.
 let sdkVersion = "0.1.0"
-let sdkName = "kirora-ios/\(sdkVersion)"
+/// What `Kirora-SDK` says: this SDK, or a wrapper that set its own (``KiroraWrapper/setSDK(name:version:)``).
+var sdkName: String { sdkHeader.current }
 
 /// A value guarded by a lock, for state shared across threads.
 final class Locked<Value>: @unchecked Sendable {

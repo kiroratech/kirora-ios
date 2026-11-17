@@ -63,6 +63,9 @@ final class FakeKirora: HTTPTransport, @unchecked Sendable {
     private let state = Locked<(requests: [SentRequest], handler: (@Sendable (SentRequest) -> FakeAnswer?)?)>(([], nil))
 
     var requests: [SentRequest] { state.withLock { $0.requests } }
+    private let completed = Locked<[SentRequest]>([])
+    /// Requests answered, as opposed to cancelled while waiting for the answer.
+    var completedRequests: [SentRequest] { completed.current }
 
     func requests(_ method: String, _ path: String) -> [SentRequest] {
         requests.filter { $0.method == method && $0.path == path }
@@ -92,6 +95,7 @@ final class FakeKirora: HTTPTransport, @unchecked Sendable {
         }
         let answer = handler?(sent) ?? Self.defaultAnswer(sent)
         if answer.delay > 0 { try await Task.sleep(nanoseconds: UInt64(answer.delay * 1_000_000_000)) }
+        completed.withLock { $0.append(sent) }
         if answer.offline { throw URLError(.notConnectedToInternet) }
         let data = try answer.body.map { try JSONEncoder().encode($0) } ?? Data()
         let response = HTTPURLResponse(url: url, statusCode: answer.status, httpVersion: "HTTP/1.1", headerFields: answer.headers)!
@@ -102,7 +106,7 @@ final class FakeKirora: HTTPTransport, @unchecked Sendable {
         switch (request.method, request.path) {
         case ("POST", "/client/v1/events/batch"):
             let results = request.events.map { event -> JSONValue in
-                .object(["idempotencyKey": event["idempotencyKey"] ?? .null, "replayed": .bool(false)])
+                .object(["idempotencyKey": event["idempotencyKey"] ?? .null, "replayed": .bool(false), "event": recordedEvent])
             }
             return .ok(.object(["results": .array(results)]))
         case ("GET", "/client/v1/push-app"):
@@ -173,12 +177,16 @@ final class TestApp: @unchecked Sendable {
     let kirora = Locked<Kirora?>(nil)
     let server = FakeKirora()
     let store = MemoryKeyValueStore()
+    /// The second copy of a tracking refusal.
+    let refusals = MemoryKeyValueStore()
     let clock = TestClock()
     let lifecycle = ManualLifecycle()
     let tokens = PushTokens()
     lazy var push = FakePushPlatform(tokens: tokens)
     let directory: URL
     var deviceInfo = DeviceInfo(
+        appName: { "Shop" }, bundleId: { "com.example.shop" },
+        screen: { DeviceInfo.Screen(width: 393, height: 852, density: 3) },
         appVersion: { "2.4.0" }, appBuild: { "412" }, osVersion: { "17.4.1" },
         locale: { "en-GB" }, timezone: { "Africa/Lagos" }
     )
@@ -195,6 +203,16 @@ final class TestApp: @unchecked Sendable {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    /// Where the client keeps `key` in the app's store.
+    func scopedKey(_ key: String, clientKey: String = "kirora_pk_test") -> String {
+        StorageKeys.scoped.contains(key) ? StorageKeys.scoped(key, "\(clientKey)@api.test.kirora.io") : key
+    }
+
+    /// What the client has stored under `key`.
+    func stored(_ key: String, clientKey: String = "kirora_pk_test") -> String? {
+        store.string(scopedKey(key, clientKey: clientKey))
+    }
+
     /// Starts (or restarts) the client.
     @discardableResult
     func start(
@@ -204,13 +222,15 @@ final class TestApp: @unchecked Sendable {
         requireTrackingConsent: Bool = false,
         trackSessions: Bool = true,
         trackAppLifecycle: Bool = false,
-        tokenTimeout: Double = 30
+        tokenTimeout: Double = 30,
+        apiUrl: String = "https://api.test.kirora.io",
+        beforeSend: (@Sendable (BeforeSendEvent) throws -> BeforeSendEvent?)? = nil
     ) -> Kirora {
         kirora.current?.destroy()
         let clock = self.clock
         let directory = self.directory
         var environment = KiroraEnvironment(
-            transport: server, store: store,
+            transport: server, store: store, refusals: refusals,
             eventsFile: { namespace in
                 PersistentFile(url: directory.appendingPathComponent("events-\(fileSafe(namespace)).json"), onError: { _ in })
             },
@@ -222,7 +242,8 @@ final class TestApp: @unchecked Sendable {
             options: KiroraOptions(
                 clientKey: clientKey, fetchUserToken: fetchUserToken, push: push,
                 requireTrackingConsent: requireTrackingConsent, trackSessions: trackSessions,
-                trackAppLifecycle: trackAppLifecycle, logLevel: .none, apiUrl: "https://api.test.kirora.io"
+                trackAppLifecycle: trackAppLifecycle, logLevel: .none, apiUrl: apiUrl,
+                beforeSend: beforeSend
             ),
             environment: environment
         )
@@ -245,3 +266,10 @@ func eventually(_ seconds: Double = 2, _ condition: () -> Bool) async -> Bool {
 func settle(_ seconds: Double = 0.15) async {
     await sleep(seconds: seconds)
 }
+
+/// What Kirora answers for an event it recorded (`TrackedEvent`).
+let recordedEvent: JSONValue = .object([
+    "id": .string("00000000-0000-4000-8000-000000000000"),
+    "occurredAt": .string("2026-11-17T00:00:00.000Z"),
+    "expiresAt": .string("2027-11-17T00:00:00.000Z"),
+])
