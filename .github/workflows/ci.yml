@@ -27,8 +27,24 @@ jobs:
           xcodebuild -version
           swift --version
 
+      # A hang fails here in 10 minutes, with a stack sample of every test process, rather
+      # than silently running out the job's time.
       - name: Test (macOS), built with strict concurrency
-        run: ./scripts/test.sh -Xswiftc -strict-concurrency=complete
+        timeout-minutes: 15
+        run: |
+          ./scripts/test.sh -Xswiftc -strict-concurrency=complete &
+          pid=$!
+          for _ in $(seq 600); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "::error::Tests still running after 10 minutes: sampling the test processes"
+            for p in $(pgrep -f 'xctest|swiftpm-testing-helper|KiroraPackageTests'); do
+              sudo sample "$p" 5 || true
+            done
+            pkill -P "$pid" || true
+            kill "$pid" || true
+            exit 1
+          fi
+          wait "$pid"
 
       - name: Build for iOS (UIKit code included)
         run: |

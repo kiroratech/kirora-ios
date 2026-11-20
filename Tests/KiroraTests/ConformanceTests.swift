@@ -447,7 +447,7 @@ struct CleanupTests {
     @Test func everyDetachNamesTheLastRegistration() async throws {
         let app = TestApp()
         let server = DeviceServer()
-        app.server.answer(server.answer)
+        app.server.answer { server.answer($0) }
         let kirora = app.start(push: .enabled)
         try await kirora.identify(userToken("A"))
         await kirora.setPushEnabled(false)
@@ -1079,41 +1079,45 @@ func queuedEvent(_ name: String) -> QueuedEvent {
 
 @Suite("Events built while beforeSend runs")
 struct BeforeSendWindowTests {
-    /// A beforeSend that waits at the gate, once `holding` is set.
-    final class Gate: @unchecked Sendable {
+    /// A beforeSend that waits at the gate while `holding` is set.
+    final class HeldBeforeSend: @unchecked Sendable {
         let holding = Locked(false)
-        let entered = DispatchSemaphore(value: 0)
+        /// Opened once an event reached the hook and waits there.
+        let entered = Gate()
         let open = DispatchSemaphore(value: 0)
         func pass(_ event: BeforeSendEvent) -> BeforeSendEvent? {
             if holding.current {
-                entered.signal()
+                entered.open()
+                // On the GCD thread `track` runs on, never a test's.
                 open.wait()
             }
             return event
         }
-    }
 
-    private func trackInBackground(_ kirora: Kirora, _ name: String) -> DispatchSemaphore {
-        let done = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
-            kirora.track(name)
-            done.signal()
+        /// Tracks `name` on another thread, holding it in beforeSend while `meanwhile` runs,
+        /// then lets it go and waits for `track` to return. Waits are bounded and never
+        /// block a Swift concurrency thread.
+        func track(_ kirora: Kirora, _ name: String, meanwhile: () async throws -> Void) async throws {
+            holding.withLock { $0 = true }
+            let returned = Gate()
+            DispatchQueue.global().async {
+                kirora.track(name)
+                returned.open()
+            }
+            await entered.wait(upTo: 5)
+            holding.withLock { $0 = false }
+            try await meanwhile()
+            open.signal()
+            await returned.wait(upTo: 5)
         }
-        return done
     }
 
     @Test func anEventOfAUserWhoSignedOutMeanwhileIsForgotten() async throws {
         let app = TestApp()
-        let gate = Gate()
-        let kirora = app.start(trackSessions: false, beforeSend: { gate.pass($0) })
+        let hook = HeldBeforeSend()
+        let kirora = app.start(trackSessions: false, beforeSend: { hook.pass($0) })
         try await kirora.identify(userToken("A"))
-        gate.holding.withLock { $0 = true }
-        let done = trackInBackground(kirora, "While signing out")
-        gate.entered.wait()
-        gate.holding.withLock { $0 = false }
-        await kirora.logout()
-        gate.open.signal()
-        done.wait()
+        try await hook.track(kirora, "While signing out") { await kirora.logout() }
         // A signs in again: nothing of theirs from before the logout is left to send.
         try await kirora.identify(userToken("A"))
         await kirora.flush()
@@ -1122,15 +1126,9 @@ struct BeforeSendWindowTests {
 
     @Test func anEventFromBeforeSignInIsAdoptedByWhoeverSignedInMeanwhile() async throws {
         let app = TestApp()
-        let gate = Gate()
-        let kirora = app.start(trackSessions: false, beforeSend: { gate.pass($0) })
-        gate.holding.withLock { $0 = true }
-        let done = trackInBackground(kirora, "Before sign-in")
-        gate.entered.wait()
-        gate.holding.withLock { $0 = false }
-        try await kirora.identify(userToken("A"))
-        gate.open.signal()
-        done.wait()
+        let hook = HeldBeforeSend()
+        let kirora = app.start(trackSessions: false, beforeSend: { hook.pass($0) })
+        try await hook.track(kirora, "Before sign-in") { try await kirora.identify(userToken("A")) }
         await kirora.flush()
         let sent = app.server.batches.filter { $0.eventNames.contains("Before sign-in") }
         #expect(sent.count == 1)
@@ -1139,17 +1137,13 @@ struct BeforeSendWindowTests {
 
     @Test func anEventBuiltBeforeConsentWasWithdrawnAndGivenAgainIsForgotten() async throws {
         let app = TestApp()
-        let gate = Gate()
-        let kirora = app.start(trackSessions: false, beforeSend: { gate.pass($0) })
+        let hook = HeldBeforeSend()
+        let kirora = app.start(trackSessions: false, beforeSend: { hook.pass($0) })
         try await kirora.identify(userToken("A"))
-        gate.holding.withLock { $0 = true }
-        let done = trackInBackground(kirora, "Before the refusal")
-        gate.entered.wait()
-        gate.holding.withLock { $0 = false }
-        kirora.setTrackingConsent(false)
-        kirora.setTrackingConsent(true)
-        gate.open.signal()
-        done.wait()
+        try await hook.track(kirora, "Before the refusal") {
+            kirora.setTrackingConsent(false)
+            kirora.setTrackingConsent(true)
+        }
         await kirora.flush()
         #expect(!app.server.sentEventNames.contains("Before the refusal"))
     }
