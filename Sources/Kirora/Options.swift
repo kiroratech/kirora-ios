@@ -13,6 +13,14 @@ public struct KiroraOptions: Sendable {
     /// events are kept. One that hasn't answered after 30 seconds counts as failed.
     public var fetchUserToken: (@Sendable () async throws -> String)?
 
+    /// Called on the main thread when the user's token fails in the background, where
+    /// nothing else would tell your app: sending events, or registering for push. Once per
+    /// failure, not per retry: again only after a request succeeds, or another
+    /// ``Kirora/identify(_:)``. Never for a failure `identify(_:)` or
+    /// ``Kirora/setPushConsent(_:)`` throws, or while the user is signing out. Sign the user
+    /// out, or ask them to sign in again.
+    public var onAuthenticationFailed: (@MainActor @Sendable (AuthenticationFailureReason) -> Void)?
+
     /// Registers this device for push notifications. Off (`nil`) by default; pass
     /// ``PushOptions/enabled`` for the defaults.
     public var push: PushOptions?
@@ -54,6 +62,7 @@ public struct KiroraOptions: Sendable {
     public init(
         clientKey: String,
         fetchUserToken: (@Sendable () async throws -> String)? = nil,
+        onAuthenticationFailed: (@MainActor @Sendable (AuthenticationFailureReason) -> Void)? = nil,
         push: PushOptions? = nil,
         requireTrackingConsent: Bool = false,
         trackSessions: Bool = true,
@@ -67,6 +76,7 @@ public struct KiroraOptions: Sendable {
         self.handleDeepLink = handleDeepLink
         self.clientKey = clientKey
         self.fetchUserToken = fetchUserToken
+        self.onAuthenticationFailed = onAuthenticationFailed
         self.push = push
         self.requireTrackingConsent = requireTrackingConsent
         self.trackSessions = trackSessions
@@ -74,6 +84,15 @@ public struct KiroraOptions: Sendable {
         self.logLevel = logLevel
         self.apiUrl = apiUrl
     }
+}
+
+/// Why the user's token failed, for ``KiroraOptions/onAuthenticationFailed``.
+public enum AuthenticationFailureReason: String, Sendable, Equatable {
+    /// `fetchUserToken` threw, or didn't answer within 30 seconds.
+    case fetchFailed = "fetch_failed"
+    /// Kirora refused the token (401) and no fresh one was accepted: refused too, or none to
+    /// try (no `fetchUserToken`, or it gave another user's token).
+    case refused
 }
 
 /// Push settings. Everything else about push (the APNs credential, the push app) comes

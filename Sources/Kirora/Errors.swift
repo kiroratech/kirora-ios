@@ -38,11 +38,19 @@ public final class KiroraApiError: KiroraError, @unchecked Sendable {
     public let code: String?
     /// From the `Retry-After` header, if any.
     public let retryAfterMs: Int?
+    /// The fields a `VALIDATION_ERROR` names, each with the part of the request it's in
+    /// (`body`, `headers`…, nil if unsaid): `events.3.name` in the body, `kirora-sdk` in the
+    /// headers.
+    let fields: [(part: String?, field: String)]
 
-    init(status: Int, code: String?, message: String, retryAfterMs: Int? = nil) {
+    init(
+        status: Int, code: String?, message: String, retryAfterMs: Int? = nil,
+        fields: [(part: String?, field: String)] = []
+    ) {
         self.status = status
         self.code = code
         self.retryAfterMs = retryAfterMs
+        self.fields = fields
         super.init(message)
     }
 

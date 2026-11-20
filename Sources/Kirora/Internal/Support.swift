@@ -150,6 +150,72 @@ func withTimeout<Value: Sendable>(
     }
 }
 
+/// Asks someone who should call `answer` once, such as an app's delegate, which may never
+/// call it: if it hasn't within `timeout`, `fallback` answers instead. Whichever is first
+/// reaches `answer`; the other is ignored. No wait if `ask` answers at once. The callback
+/// form of ``withTimeout(seconds:_:)``, for APIs that answer through a handler.
+func askWithFallback<Value: Sendable>(
+    timeout: Double,
+    answer: @escaping @Sendable (Value) -> Void,
+    ask: (@escaping @Sendable (Value) -> Void) -> Void,
+    fallback: @escaping @Sendable (@escaping @Sendable (Value) -> Void) -> Void
+) {
+    let answered = Locked(false)
+    let timer = Locked<Task<Void, Never>?>(nil)
+    let once: @Sendable (Value) -> Void = { value in
+        guard answered.claimOnce() else { return }
+        timer.take()?.cancel()
+        answer(value)
+    }
+    ask(once)
+    if answered.current { return }
+    timer.withLock { stored in
+        stored = Task {
+            await sleep(seconds: timeout)
+            if !Task.isCancelled { fallback(once) }
+        }
+    }
+    // Answered while the timer was being set: it has nothing left to do.
+    if answered.current { timer.take()?.cancel() }
+}
+
+/// Opened once; until then, callers wait for it, each up to its own limit.
+final class Gate: @unchecked Sendable {
+    private let state = Locked<(open: Bool, waiting: [UUID: CheckedContinuation<Void, Never>])>((false, [:]))
+
+    /// Lets every waiter go, and any later one through at once.
+    func open() {
+        let waiting = state.withLock { state -> [CheckedContinuation<Void, Never>] in
+            state.open = true
+            defer { state.waiting = [:] }
+            return Array(state.waiting.values)
+        }
+        waiting.forEach { $0.resume() }
+    }
+
+    /// Returns once open, or after `seconds`, whichever is first.
+    func wait(upTo seconds: Double) async {
+        let id = UUID()
+        let timer = Locked<Task<Void, Never>?>(nil)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let waits = state.withLock { state -> Bool in
+                guard !state.open else { return false }
+                state.waiting[id] = continuation
+                return true
+            }
+            guard waits else { return continuation.resume() }
+            timer.withLock { stored in
+                stored = Task {
+                    await sleep(seconds: seconds)
+                    // Still waiting: resumed here, unless open() just took it.
+                    self.state.withLock { $0.waiting.removeValue(forKey: id) }?.resume()
+                }
+            }
+        }
+        timer.take()?.cancel()
+    }
+}
+
 /// The longest the SDK ever waits in one go: a week. A longer wait, such as an absurd
 /// `Retry-After`, is cut to it; a retry is then tried, and refused again if still too early.
 let maxWaitSeconds: Double = 7 * 24 * 60 * 60

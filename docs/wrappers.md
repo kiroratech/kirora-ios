@@ -7,15 +7,27 @@ the omnichannel repo.
 
 ## Linking
 
-Both link native iOS code through CocoaPods. Depend on the pod in the wrapper's own podspec:
+React Native links native iOS code through CocoaPods; Flutter through CocoaPods or Swift
+Package Manager, whichever the app uses, so a Flutter plugin ships both. In the wrapper's
+podspec:
 
 ```ruby
 s.dependency 'Kirora', '~> 0.1'
 ```
 
-Name a version range, and say in the wrapper's release notes which native versions it was
-tested with. The app's Notification Service Extension adds `KiroraNotificationService`
-itself (see the README's "Delivery reports and images").
+and in a Flutter plugin's `ios/<plugin>/Package.swift`, beside Flutter's own
+`FlutterFramework` dependency:
+
+```swift
+.package(url: "https://github.com/kiroratech/kirora-ios.git", from: "0.1.0"),
+// in the target: .product(name: "Kirora", package: "kirora-ios")
+```
+
+Swift Package Manager resolves versions from this repo's git tags, so a release must be
+tagged before a wrapper's manifest can use it. Name a version range, and say in the wrapper's
+release notes which native versions it was tested with. The app's Notification Service
+Extension adds `KiroraNotificationService` itself (see the README's "Delivery reports and
+images").
 
 The wrapper surface is Swift SPI. The wrapper's native module, written in Swift, imports it:
 
@@ -49,7 +61,9 @@ tapped while another waits takes its place.
 ## Setup, in order
 
 ```swift
-// 1. Before creating the client: the wrapper's name in `Kirora-SDK`.
+// 1. Before creating the client: the wrapper's name in `Kirora-SDK`. Kirora refuses every
+//    call whose version isn't 1 to 40 of 0-9 A-Z a-z . + - (so not `1.0.0_rc1`): such a
+//    version is ignored and logged, and the SDK's own name sent.
 KiroraWrapper.setSDK(name: "kirora-react-native", version: wrapperVersion)
 
 // 2. Tokens answered from JavaScript or Dart.
@@ -61,6 +75,9 @@ let tokens = KiroraWrapper.TokenRequests { requestId in
 let kirora = Kirora(options: KiroraOptions(
     clientKey: clientKey,
     fetchUserToken: hasFetchUserToken ? { try await tokens.fetchUserToken() } : nil,
+    // reason.rawValue is "fetch_failed" or "refused", the spec's names.
+    onAuthenticationFailed: hasAuthenticationFailedHandler
+        ? { reason in emit("kirora.authenticationFailed", ["reason": reason.rawValue]) } : nil,
     push: pushOptions,
     requireTrackingConsent: requireTrackingConsent,
     trackSessions: trackSessions,
@@ -90,10 +107,17 @@ or `tokens.fail(requestId, message:)`.
   that launched the app) are held, the latest ten, and delivered in order when it is. A tap
   carries the push's data as JSON values, the button's position (nil for the notification
   itself), the action identifier, and the link opened.
+- **Native listeners.** An app may also add `Kirora.addNotificationClickListener` in native
+  code; both hear each tap. Each holds the taps it missed (the latest ten) until it has a
+  listener, so a detached wrapper's next listener hears them whatever the app listens to.
+- **Buttons.** A push's buttons come from the app's Notification Service Extension
+  (`KiroraNotificationService`), which the wrapper doesn't create: its README says so.
 - **Callbacks.** `handleDeepLink` and foreground display wait 1.5 seconds at most for the
   app's answer, then act as if there were no callback: the link is opened, the push shown.
   An app's own native `handleDeepLink`, or notification delegate implementing `willPresent`,
-  decides first.
+  decides first; a delegate that leaves a Kirora push unanswered for 1.5 seconds (as plugins
+  such as `flutter_local_notifications` do with pushes they didn't schedule) has the SDK
+  decide instead, so the wrapper's foreground handler is then asked.
 - **Teardown.** When the wrapper's language goes away but the app doesn't (a Flutter
   engine torn down, a React Native bridge invalidated), call `KiroraWrapper.wrapperDetached()`,
   not `setDeepLinkHandler(nil)`: taps are held again and a tap's link waits for the next

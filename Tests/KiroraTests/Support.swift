@@ -3,14 +3,15 @@ import Foundation
 
 /// A user token naming `sub`, as the customer's server signs it (the SDK never checks the
 /// signature: Kirora does).
-func userToken(_ sub: String?, issuedAt: Int = 1_700_000_000) -> String {
+/// Valid for the hour after `issuedAt`; by default, from just before the test clock's time.
+func userToken(_ sub: String?, issuedAt: Int = 1_799_999_000, expiresIn: Int = 3600) -> String {
     func encode(_ object: [String: Any]) -> String {
         let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         return data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
     }
-    var claims: [String: Any] = ["iat": issuedAt, "exp": issuedAt + 3600]
+    var claims: [String: Any] = ["iat": issuedAt, "exp": issuedAt + expiresIn]
     if let sub { claims["sub"] = sub }
     return "\(encode(["alg": "HS256", "typ": "JWT"])).\(encode(claims)).signature"
 }
@@ -46,6 +47,16 @@ struct FakeAnswer: Sendable {
     }
     static let noContent = FakeAnswer(status: 204, body: nil)
     static let networkError = FakeAnswer(status: 0, body: nil, offline: true)
+    /// Kirora's 400 for a request whose body (or `in`) fields are invalid, naming each.
+    static func validationError(fields: [String], in part: String = "body") -> FakeAnswer {
+        let errors = fields.map { field -> JSONValue in
+            .object(["in": .string(part), "field": .string(field), "code": .string("custom"), "message": .string("invalid")])
+        }
+        return FakeAnswer(status: 400, body: .object(["error": .object([
+            "code": .string("VALIDATION_ERROR"), "message": .string("invalid"), "errors": .array(errors),
+        ])]))
+    }
+
     static func error(_ status: Int, _ code: String, retryAfter: String? = nil) -> FakeAnswer {
         FakeAnswer(
             status: status,
@@ -218,6 +229,7 @@ final class TestApp: @unchecked Sendable {
     func start(
         clientKey: String = "kirora_pk_test",
         fetchUserToken: (@Sendable () async throws -> String)? = nil,
+        onAuthenticationFailed: (@MainActor @Sendable (AuthenticationFailureReason) -> Void)? = nil,
         push: PushOptions? = nil,
         requireTrackingConsent: Bool = false,
         trackSessions: Bool = true,
@@ -240,7 +252,8 @@ final class TestApp: @unchecked Sendable {
         environment.logoutWait = logoutWait
         let client = Kirora(
             options: KiroraOptions(
-                clientKey: clientKey, fetchUserToken: fetchUserToken, push: push,
+                clientKey: clientKey, fetchUserToken: fetchUserToken,
+                onAuthenticationFailed: onAuthenticationFailed, push: push,
                 requireTrackingConsent: requireTrackingConsent, trackSessions: trackSessions,
                 trackAppLifecycle: trackAppLifecycle, logLevel: .none, apiUrl: apiUrl,
                 beforeSend: beforeSend
@@ -266,6 +279,12 @@ func eventually(_ seconds: Double = 2, _ condition: () -> Bool) async -> Bool {
 func settle(_ seconds: Double = 0.15) async {
     await sleep(seconds: seconds)
 }
+
+/// What a failing `fetchUserToken` throws in tests.
+struct TokenServerDown: Error {}
+
+/// The tests' `apiUrl`, which push reports must be on.
+let testApiBase = URL(string: "https://api.test.kirora.io")!
 
 /// What Kirora answers for an event it recorded (`TrackedEvent`).
 let recordedEvent: JSONValue = .object([

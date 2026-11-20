@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- `trackingConsent`: whether tracking is allowed now, as `getState().trackingConsent`,
+  without reading the event queue.
+- Fix: foreground Kirora pushes were dropped when the app's notification delegate (or a
+  library in its chain, such as `flutter_local_notifications`) implements `willPresent` but
+  ignores notifications it didn't schedule. The app's delegate still decides first; if it
+  hasn't answered within 1.5 seconds, the SDK shows the push. A Kirora tap a delegate leaves
+  unanswered has its completion handler called likewise.
+- Push buttons show: the Notification Service Extension makes a category from the push's
+  `buttons` and adds it to the app's own. Without the extension, still none.
+- `Kirora.addNotificationClickListener(_:)`: hears taps on Kirora pushes and their buttons,
+  with the push's data, on the main thread; taps from before any listener (the latest ten)
+  go to the first one. `KiroraPushTap` is public.
+- A user token is refreshed 60 seconds before its `exp`, and on returning to the foreground
+  after it expired, not only after a `401`. An expired token that can't be refreshed is told
+  to `onAuthenticationFailed` as `.fetchFailed`.
+- A `401` that no fresh token resolves backs off (with `fetchUserToken`) or stops sending
+  until the next `identify()` (without), instead of retrying and asking for a token at every
+  send.
+- A whole-request refusal no event caused (a redirect, `403`, `404`, `409`, or a `400` about
+  a header) keeps the events and backs off, instead of dropping them: a wrong `apiUrl` or a
+  captive portal could empty the queue. A `400` is split to find the event at fault only when
+  its `errors` name a field under `events`.
+- Push reports go only to a `/t/p/…` address on the configured `apiUrl` (under its path, if
+  it has one); a tap heard before any client exists waits for one, 10 seconds at most. The extension uses
+  `https://api.kirora.io`, or its own `KiroraApiUrl` Info.plist key.
+- Wrappers: `setSDK` takes only `kirora-react-native` and `kirora-flutter`, with a version
+  Kirora accepts (`[0-9A-Za-z.+-]{1,40}`); anything else is ignored and logged.
+
+- `onAuthenticationFailed`: called on the main thread with `.fetchFailed` or `.refused`
+  when the user's token fails in the background, where no method would throw it; not for
+  work `identify()` started that fails as `identify()` itself throws.
 - CocoaPods: `Kirora` and `KiroraNotificationService` pods, beside Swift Package Manager.
 - For the React Native and Flutter SDKs, which wrap this one (`@_spi(Wrapper)`, not for
   apps): their own `Kirora-SDK` name, `fetchUserToken` answered across the bridge, a tap

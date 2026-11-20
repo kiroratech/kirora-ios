@@ -56,12 +56,25 @@ public final class Kirora: @unchecked Sendable {
         if !options.clientKey.hasPrefix("kirora_pk_") {
             log.error("clientKey should be your client key, kirora_pk_…")
         }
-        identity = Identity(fetchUserToken: options.fetchUserToken, tokenTimeout: environment.tokenTimeout)
+        identity = Identity(
+            fetchUserToken: options.fetchUserToken, tokenTimeout: environment.tokenTimeout,
+            onAuthenticationFailed: options.onAuthenticationFailed, now: environment.now
+        )
         api = ClientAPI(
             clientKey: options.clientKey, apiUrl: options.apiUrl,
             identity: identity, transport: environment.transport
         )
         if let problem = api.urlProblem { log.error(problem) }
+        if let apiUrl = api.apiUrl {
+            useApiUrlForReports(apiUrl)
+            // For a tap that launches the app before the next launch's client exists. Only
+            // with push: without it, nothing is stored before consent. Off the app's thread,
+            // as it may read the file.
+            if options.push != nil {
+                let store = environment.store
+                DispatchQueue.global(qos: .utility).async { store.set(apiUrl.absoluteString, for: StorageKeys.apiUrl) }
+            }
+        }
         store = WorkspaceStore(base: environment.store, namespace: api.namespace)
         queue = EventQueue.shared(file: environment.eventsFile(api.namespace), log: log)
         consent = TrackingConsent(
@@ -298,7 +311,9 @@ public final class Kirora: @unchecked Sendable {
         guard !destroyed else { return }
         let user = identity.user
         do {
-            try await api.request("PUT", "/push-consent", body: JSONValue.object(["granted": .bool(granted)]))
+            try await Identity.$callerHearsFailures.withValue(true) {
+                try await api.request("PUT", "/push-consent", body: JSONValue.object(["granted": .bool(granted)]))
+            }
         } catch {
             throw asKiroraError(error)
         }
@@ -323,6 +338,12 @@ public final class Kirora: @unchecked Sendable {
         else { return }
         store.set(nil, for: StorageKeys.pushConsent)
     }
+
+    /// Whether tracking is allowed now: the user's answer to ``setTrackingConsent(_:)``, or
+    /// the default for ``KiroraOptions/requireTrackingConsent`` without one. The same as
+    /// `getState().trackingConsent`, without reading the rest of the state (the event queue
+    /// included). Never prompts or fails.
+    public var trackingConsent: Bool { consent.allowed }
 
     /// A snapshot of the client, for your app's support and debug screens. Read-only and
     /// never sent anywhere: it never prompts, makes no network call and never fails.
@@ -389,10 +410,9 @@ public final class Kirora: @unchecked Sendable {
         let delivery = self.delivery
         Task { await delivery.flush() }
         do {
-            try await push.register()
-        } catch let error as KiroraApiError where error.status == 401 {
-            throw error
-        } catch let error as UserTokenError {
+            // identify() throws a token failure here itself.
+            try await Identity.$callerHearsFailures.withValue(true) { try await push.register() }
+        } catch where (error as? KiroraApiError)?.status == 401 || error is UserTokenError {
             throw error
         } catch {
             log.error("Push registration failed", error)
@@ -408,6 +428,7 @@ public final class Kirora: @unchecked Sendable {
             if options.trackAppLifecycle { tracker.trackAll(lifecycleEvents.launch) }
             appOpens.appCameToForeground()
         case .foreground:
+            identity.appCameToForeground()
             tracker.noteActivity()
             if options.trackAppLifecycle {
                 let (name, properties) = lifecycleEvents.opened(fromBackground: true)
@@ -466,6 +487,12 @@ struct KiroraEnvironment {
     var now: @Sendable () -> Date
     var installPushIntegration: (Log) -> Void
 
+    /// The app's `state.json`, shared by every client, and readable before any exists.
+    static func liveStateStore(onError: @escaping @Sendable (Error) -> Void = { _ in }) -> FileKeyValueStore {
+        let url = StorageLocation.directory().appendingPathComponent("state.json")
+        return FileKeyValueStore.shared(file: PersistentFile(url: url, onError: onError))
+    }
+
     static func live(log: Log) -> KiroraEnvironment {
         let directory = StorageLocation.directory()
         let onError: @Sendable (Error) -> Void = { error in log.error("Couldn't save to the device", error) }
@@ -481,7 +508,7 @@ struct KiroraEnvironment {
         #endif
         return KiroraEnvironment(
             transport: URLSessionTransport(),
-            store: FileKeyValueStore.shared(file: PersistentFile(url: directory.appendingPathComponent("state.json"), onError: onError)),
+            store: liveStateStore(onError: onError),
             refusals: FileKeyValueStore.shared(file: PersistentFile(url: directory.appendingPathComponent("consent.json"), onError: onError)),
             eventsFile: { namespace in
                 PersistentFile(url: directory.appendingPathComponent("events-\(fileSafe(namespace)).json"), onError: onError)

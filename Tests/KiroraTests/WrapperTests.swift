@@ -10,10 +10,18 @@ struct WrapperTests {
     @Test func aWrapperNamesItselfInKiroraSDK() async throws {
         #expect(sdkHeaderValue(name: "kirora-react-native", version: "1.2.0") == "kirora-react-native/1.2.0")
         #expect(sdkHeaderValue(name: "kirora-flutter", version: "0.3.1") == "kirora-flutter/0.3.1")
+        #expect(sdkHeaderValue(name: "kirora-flutter", version: "1.0.0-rc.1+build.7") != nil)
+        #expect(sdkHeaderValue(name: "kirora-flutter", version: String(repeating: "1", count: 40)) != nil)
+        // Only what Kirora accepts (`<sdk>/[0-9A-Za-z.+-]{1,40}`): anything else would make it
+        // refuse every call, and every event would wait unsent.
         for (name, version) in [("react-native", "1.0.0"), ("kirora-", "1.0.0"), ("Kirora-RN", "1.0.0"),
-                                ("kirora-flutter", ""), ("kirora-flutter", "1/2"), ("kirora-flutter", "1 0")] {
+                                ("kirora-unity", "1.0.0"), ("kirora-flutter", ""), ("kirora-flutter", "1/2"),
+                                ("kirora-flutter", "1 0"), ("kirora-flutter", "1.0.0_rc1"), ("kirora-flutter", "1.0.0é"),
+                                ("kirora-flutter", String(repeating: "1", count: 41))] {
             #expect(sdkHeaderValue(name: name, version: version) == nil)
         }
+        // This SDK's own version passes the same rule.
+        #expect(isValidVersion(sdkVersion))
         // A client sends the name it was created with.
         let server = FakeKirora()
         let identity = Identity(fetchUserToken: nil)
@@ -90,11 +98,87 @@ struct WrapperTests {
         #expect(heard.current.count == 11)
     }
 
+    @Test func anAppListenerHearsTapsOnTheMainThreadHeldOnesFirst() async {
+        let events = PushTapEvents()
+        events.deliver(KiroraPushTap(data: ["n": 1], buttonIndex: nil, actionIdentifier: "default", link: nil))
+        events.deliver(KiroraPushTap(data: ["n": 2], buttonIndex: 0, actionIdentifier: "0", link: URL(string: "myapp://a")))
+        let heard = Locked<[Int]>([])
+        let id = events.addAppListener { tap in heard.withLock { $0.append(tap.data["n"] as! Int) } }
+        #expect(heard.current == [1, 2])
+        events.deliver(KiroraPushTap(data: ["n": 3], buttonIndex: nil, actionIdentifier: "default", link: nil))
+        #expect(heard.current == [1, 2, 3])
+        events.removeAppListener(id)
+        events.deliver(KiroraPushTap(data: ["n": 4], buttonIndex: nil, actionIdentifier: "default", link: nil))
+        #expect(heard.current == [1, 2, 3])
+    }
+
+    /// A wrapper detached (a Flutter engine torn down) holds taps again, even while the app
+    /// listens natively: the engine that attaches next hears them.
+    @Test func aDetachedWrapperHoldsTapsWhateverTheAppListensTo() {
+        let events = PushTapEvents()
+        let app = Locked<[Int]>([])
+        _ = events.addAppListener { tap in app.withLock { $0.append(tap.data["n"] as! Int) } }
+        let wrapper = Locked<[Int]>([])
+        events.setListener { tap in wrapper.withLock { $0.append(tap.data["n"] as! Int) } }
+        events.deliver(KiroraPushTap(data: ["n": 1], buttonIndex: nil, actionIdentifier: "default", link: nil))
+        events.setListener(nil)
+        events.deliver(KiroraPushTap(data: ["n": 2], buttonIndex: nil, actionIdentifier: "default", link: nil))
+        #expect(app.current == [1, 2])
+        #expect(wrapper.current == [1])
+        events.setListener { tap in wrapper.withLock { $0.append(tap.data["n"] as! Int) } }
+        #expect(wrapper.current == [1, 2])
+    }
+
+    @Test func thePublicListenerHearsTapsInOrder() async {
+        let heard = Locked<[String]>([])
+        let prefix = "order-\(UUID().uuidString)-"
+        let registration = Kirora.addNotificationClickListener { tap in
+            guard tap.actionIdentifier.hasPrefix(prefix) else { return }
+            heard.withLock { $0.append(tap.actionIdentifier) }
+        }
+        for index in 0..<50 {
+            pushTapEvents.deliver(KiroraPushTap(data: [:], buttonIndex: nil, actionIdentifier: "\(prefix)\(index)", link: nil))
+        }
+        #expect(await eventually { heard.current.count == 50 })
+        #expect(heard.current == (0..<50).map { "\(prefix)\($0)" })
+        registration.remove()
+    }
+
+    @Test func aRemovedListenerHearsNothingStillQueued() async {
+        let heard = Locked(0)
+        let prefix = "removed-\(UUID().uuidString)-"
+        let registration = Kirora.addNotificationClickListener { tap in
+            if tap.actionIdentifier.hasPrefix(prefix) { heard.withLock { $0 += 1 } }
+        }
+        // Queued while the main actor is busy, then removed before it gets to them.
+        await MainActor.run {
+            for index in 0..<5 {
+                pushTapEvents.deliver(KiroraPushTap(data: [:], buttonIndex: nil, actionIdentifier: "\(prefix)\(index)", link: nil))
+            }
+            registration.remove()
+        }
+        await settle()
+        #expect(heard.current == 0)
+    }
+
+    @Test func thePublicListenerIsCalledOnTheMainActor() async {
+        let heard = Locked<[String]>([])
+        let registration = Kirora.addNotificationClickListener { tap in
+            MainActor.assertIsolated()
+            heard.withLock { $0.append(tap.actionIdentifier) }
+        }
+        let id = "public-\(UUID().uuidString)"
+        pushTapEvents.deliver(KiroraPushTap(data: [:], buttonIndex: nil, actionIdentifier: id, link: nil))
+        #expect(await eventually { heard.current.contains(id) })
+        registration.remove()
+        registration.remove()
+    }
+
     @Test func aTapIsReportedBeforeTheWrapperHearsIt() async throws {
         let server = FakeKirora()
         let order = Locked<[String]>([])
         server.answer { _ in order.withLock { $0.append("reported") }; return nil }
-        let handler = PushTapHandler(transport: server, openURL: { _ in order.withLock { $0.append("opened") } })
+        let handler = PushTapHandler(transport: server, apiBase: { testApiBase }, openURL: { _ in order.withLock { $0.append("opened") } })
         let payload = KiroraPushPayload(userInfo: [
             "kirora": "true", "trackingUrl": "https://api.test.kirora.io/t/p/abc", "actionUrl": "myapp://orders/1",
         ])!
@@ -109,7 +193,7 @@ struct WrapperTests {
     @Test func aSlowReportHoldsTheTapEventNoMoreThanItsLimit() async {
         let server = FakeKirora()
         server.answer { _ in FakeAnswer(status: 204, body: nil, delay: 3) }
-        let handler = PushTapHandler(transport: server, openURL: { _ in })
+        let handler = PushTapHandler(transport: server, apiBase: { testApiBase }, openURL: { _ in })
         let payload = KiroraPushPayload(userInfo: ["kirora": "true", "trackingUrl": "https://api.test.kirora.io/t/p/abc"])!
         let heardAt = Locked<Date?>(nil)
         let started = Date()

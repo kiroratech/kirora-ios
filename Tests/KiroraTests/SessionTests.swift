@@ -2,6 +2,21 @@ import Foundation
 import Testing
 @testable import Kirora
 
+@Suite("Tracking consent, read alone")
+struct TrackingConsentReadTests {
+    @Test func answersAsGetStateDoes() {
+        let app = TestApp()
+        let kirora = app.start(requireTrackingConsent: true)
+        #expect(!kirora.trackingConsent)
+        #expect(kirora.trackingConsent == kirora.getState().trackingConsent)
+        kirora.setTrackingConsent(true)
+        #expect(kirora.trackingConsent)
+        kirora.setTrackingConsent(false)
+        #expect(!kirora.trackingConsent)
+        #expect(kirora.trackingConsent == kirora.getState().trackingConsent)
+    }
+}
+
 @Suite("Visits, lifecycle and consent")
 struct SessionTests {
     @Test func aVisitBeginsWithSessionStartedWithoutProperties() async throws {

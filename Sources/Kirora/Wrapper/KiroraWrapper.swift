@@ -15,10 +15,11 @@ import Foundation
 public enum KiroraWrapper {
     /// Sends `Kirora-SDK: <name>/<version>` (`kirora-react-native/1.0.0`) instead of this
     /// SDK's own name, so Kirora knows which SDK the app uses. Call it once, before creating
-    /// the client. A name that isn't `kirora-…`, or an empty version, is ignored and logged.
+    /// the client. A name Kirora doesn't know, or a version it would refuse (other than 1 to
+    /// 40 of `0-9 A-Z a-z . + -`), is ignored and logged: Kirora would refuse every call.
     public static func setSDK(name: String, version: String) {
         guard let header = sdkHeaderValue(name: name, version: version) else {
-            Log(level: .error).error("setSDK ignored: expected a name like kirora-react-native and a version")
+            Log(level: .error).error("setSDK ignored: expected kirora-react-native or kirora-flutter, and a version of 1 to 40 of 0-9 A-Z a-z . + -")
             return
         }
         sdkHeader.withLock { $0 = header }
@@ -152,22 +153,6 @@ public enum KiroraWrapper {
     }
 }
 
-/// A tap on a Kirora push, for a wrapper's tap listener.
-@_spi(Wrapper)
-public struct KiroraPushTap: @unchecked Sendable {
-    /// The push's own keys (`kirora`, `trackingUrl`, `actionUrl`, `buttons`, the sender's
-    /// data, `aps`), as JSON values.
-    public let data: [String: Any]
-    /// The tapped button's position, or nil for a tap on the notification itself.
-    public let buttonIndex: Int?
-    /// The notification action's identifier: `com.apple.UNNotificationDefaultActionIdentifier`
-    /// for a tap on the notification, or the app's action identifier for a button.
-    public let actionIdentifier: String
-    /// The tap's link, if it had one: by the time the listener hears the tap, the SDK has
-    /// opened it or handed it to the app's handler, unless a later launch tap took its place.
-    public let link: URL?
-}
-
 /// An error a wrapper reported, or a bridge that didn't answer.
 struct WrapperError: Error, CustomStringConvertible {
     let description: String
@@ -279,51 +264,27 @@ func wrapperData(_ userInfo: [AnyHashable: Any]) -> [String: Any] {
     return data
 }
 
-/// Taps waiting for the wrapper's listener, the latest ten, and the listener once attached.
-final class PushTapEvents: @unchecked Sendable {
-    static let held = 10
-
-    private let state = Locked<(listener: (@Sendable (KiroraPushTap) -> Void)?, waiting: [KiroraPushTap])>((nil, []))
-
-    func deliver(_ tap: KiroraPushTap) {
-        let listener = state.withLock { state -> (@Sendable (KiroraPushTap) -> Void)? in
-            if let listener = state.listener { return listener }
-            state.waiting.append(tap)
-            if state.waiting.count > Self.held { state.waiting.removeFirst(state.waiting.count - Self.held) }
-            return nil
-        }
-        listener?(tap)
-    }
-
-    func setListener(_ listener: (@Sendable (KiroraPushTap) -> Void)?) {
-        let waiting = state.withLock { state -> [KiroraPushTap] in
-            state.listener = listener
-            guard listener != nil else { return [] }
-            defer { state.waiting = [] }
-            return state.waiting
-        }
-        if let listener { waiting.forEach(listener) }
-    }
-}
-
-let pushTapEvents = PushTapEvents()
-
 /// The `Kirora-SDK` header: this SDK's own, or the wrapper's.
 let sdkHeader = Locked("kirora-ios/\(sdkVersion)")
 
 /// `Kirora-SDK` for a wrapper, or nil if the name or version isn't one.
 func sdkHeaderValue(name: String, version: String) -> String? {
-    isValidSDKName(name) && isValidVersion(version) ? "\(name)/\(version)" : nil
+    wrapperSDKNames.contains(name) && isValidVersion(version) ? "\(name)/\(version)" : nil
 }
 
-private func isValidSDKName(_ name: String) -> Bool {
-    name.hasPrefix("kirora-") && name.count > "kirora-".count
-        && name.allSatisfy { $0.isASCII && ($0.isLowercase || $0.isNumber || $0 == "-") }
-}
+/// The SDK names Kirora accepts in `Kirora-SDK` from a wrapper.
+private let wrapperSDKNames: Set<String> = ["kirora-react-native", "kirora-flutter"]
 
-private func isValidVersion(_ version: String) -> Bool {
-    !version.isEmpty && version.count <= 64
-        && version.allSatisfy { $0.isASCII && !$0.isWhitespace && $0 != "/" }
+/// Kirora's own rule for the version (`[0-9A-Za-z.+-]{1,40}`): anything else is refused with
+/// a 400 on every call.
+func isValidVersion(_ version: String) -> Bool {
+    (1...40).contains(version.utf8.count)
+        && version.unicodeScalars.allSatisfy { scalar in
+            switch scalar {
+            case "0"..."9", "A"..."Z", "a"..."z", ".", "+", "-": return true
+            default: return false
+            }
+        }
 }
 
 /// A value passed across threads that is safe to, though its type doesn't say so: one the

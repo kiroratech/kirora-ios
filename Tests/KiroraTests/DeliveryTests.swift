@@ -4,6 +4,28 @@ import Testing
 
 @Suite("Events and delivery")
 struct DeliveryTests {
+    @Test func identifyingTheSameUserAgainMidSendSendsEachEventOnce() async throws {
+        let app = TestApp()
+        let kirora = app.start(trackSessions: false)
+        let firstBatch = Locked(true)
+        app.server.answer { request in
+            guard request.path == "/client/v1/events/batch", firstBatch.withLock({ first in defer { first = false }; return first }) else { return nil }
+            var answer = FakeKirora.defaultAnswer(request)
+            answer.delay = 0.3
+            return answer
+        }
+        try await kirora.identify(userToken("user-1"))
+        kirora.track("One")
+        let held = Task { await kirora.flush() }
+        #expect(await eventually { app.server.batches.count == 1 })
+        try await kirora.identify(userToken("user-1", issuedAt: 1_799_999_100))
+        kirora.track("Two")
+        await kirora.flush()
+        await held.value
+        #expect(app.server.batches.count == 2)
+        #expect(app.server.sentEventNames == ["One", "Two"])
+    }
+
     @Test func anEventCarriesItsKeyTimeAndContext() async throws {
         let app = TestApp()
         let kirora = app.start()
@@ -90,7 +112,7 @@ struct DeliveryTests {
 
     @Test func aServerErrorKeepsEventsForARetry() async throws {
         let app = TestApp()
-        let kirora = app.start()
+        let kirora = app.start(trackSessions: false)
         let failures = Locked(1)
         app.server.answer { request in
             guard request.path.hasSuffix("/events/batch") else { return nil }
@@ -99,8 +121,9 @@ struct DeliveryTests {
                 return left > 0 ? FakeAnswer.error(503, "UNAVAILABLE") : nil
             }
         }
-        try await kirora.identify(userToken("user-1"))
+        // Waiting before sign-in, so it's in the first batch, alone.
         kirora.track("Order Completed")
+        try await kirora.identify(userToken("user-1"))
         #expect(await eventually { app.server.batches.count == 2 })
         let first = try #require(app.server.batches.first?.events.last?["idempotencyKey"])
         #expect(app.server.batches.last?.events.last?["idempotencyKey"] == first)
@@ -132,7 +155,9 @@ struct DeliveryTests {
         kirora.track("Order Completed")
         await kirora.flush()
         await kirora.flush()
-        #expect(app.server.batches.count == 1)
+        // Dropped at the first refusal: never sent again.
+        #expect(app.server.sentEventNames.filter { $0 == "Order Completed" }.count == 1)
+        #expect(kirora.getState().queuedEventCount == 0)
     }
 
     @Test func anInvalidBatchIsSplitToFindTheBadEvent() async throws {
@@ -140,7 +165,8 @@ struct DeliveryTests {
         let kirora = app.start(trackSessions: false)
         app.server.answer { request in
             guard request.path.hasSuffix("/events/batch") else { return nil }
-            return request.eventNames.contains("Bad") ? .error(400, "VALIDATION_ERROR") : nil
+            guard let bad = request.eventNames.firstIndex(of: "Bad") else { return nil }
+            return .validationError(fields: ["events.\(bad).name"])
         }
         for name in ["A", "B", "Bad", "C"] { kirora.track(name) }
         try await kirora.identify(userToken("user-1"))
@@ -148,6 +174,92 @@ struct DeliveryTests {
         #expect(await eventually {
             Set(app.server.batches.filter { !$0.eventNames.contains("Bad") }.flatMap(\.eventNames)) == ["A", "B", "C"]
         })
+    }
+
+    /// A whole request refused for something no event caused: from a wrong `apiUrl`, a proxy
+    /// or captive portal, or a `Kirora-SDK` header Kirora won't take. Dropping would empty the
+    /// queue, so the events wait and go once the request is accepted.
+    @Test func aWholeRequestRefusalKeepsTheEvents() async throws {
+        let refusals: [FakeAnswer] = [
+            .error(403, "FORBIDDEN"), .error(404, "NOT_FOUND"), .error(409, "CONFLICT"),
+            FakeAnswer(status: 302, body: nil, headers: ["Location": "https://portal.example"]),
+            FakeAnswer(status: 404, body: nil),
+            .validationError(fields: ["kirora-sdk"], in: "headers"),
+            // A proxy's own 400: not Kirora's error body.
+            FakeAnswer(status: 400, body: nil),
+            // Kirora's, but no event at fault.
+            .error(400, "BAD_REQUEST"),
+            .error(400, "VALIDATION_ERROR"),
+        ]
+        for refusal in refusals {
+            let app = TestApp()
+            let kirora = app.start(trackSessions: false)
+            let refusing = Locked(true)
+            app.server.answer { request in
+                request.path.hasSuffix("/events/batch") && refusing.current ? refusal : nil
+            }
+            for name in ["A", "B", "C"] { kirora.track(name) }
+            try await kirora.identify(userToken("user-1"))
+            await kirora.flush()
+            // Never split: each event alone would be refused the same.
+            #expect(app.server.batches.allSatisfy { $0.events.count == 3 }, "\(refusal.status)")
+            #expect(kirora.getState().queuedEventCount == 3, "\(refusal.status)")
+            refusing.withLock { $0 = false }
+            #expect(await eventually { kirora.getState().queuedEventCount == 0 }, "\(refusal.status)")
+            #expect(Set(app.server.sentEventNames) == ["A", "B", "C"])
+        }
+    }
+
+    /// A whole-request refusal backs off like a server error: it isn't retried at once.
+    @Test func aWholeRequestRefusalBacksOff() async throws {
+        let app = TestApp()
+        app.timing = DeliveryTiming(flushAtEvents: 20, flushInterval: 0.3, maxRetryDelay: 5)
+        let kirora = app.start(trackSessions: false)
+        app.server.answer { $0.path.hasSuffix("/events/batch") ? .error(404, "NOT_FOUND") : nil }
+        try await kirora.identify(userToken("user-1"))
+        for index in 0..<5 { kirora.track("Event \(index)") }
+        await settle(0.5)
+        #expect(app.server.batches.count <= 2)
+    }
+
+    @Test func a401WithNoFetchUserTokenWaitsForIdentify() async throws {
+        let app = TestApp()
+        let kirora = app.start(trackSessions: false)
+        let refusing = Locked(true)
+        app.server.answer { $0.path.hasSuffix("/events/batch") && refusing.current ? .error(401, "UNAUTHORIZED") : nil }
+        try await kirora.identify(userToken("user-1"))
+        kirora.track("One")
+        await kirora.flush()
+        let tries = app.server.batches.count
+        // Nothing goes as the refused token: not on a timer, a new event or a flush.
+        for index in 0..<25 { kirora.track("More \(index)") }
+        await kirora.flush()
+        await settle(0.4)
+        #expect(app.server.batches.count == tries)
+        #expect(kirora.getState().queuedEventCount == 26)
+        // A new token from identify() sends them.
+        refusing.withLock { $0 = false }
+        try await kirora.identify(userToken("user-1", issuedAt: 1_799_999_500))
+        #expect(await eventually { kirora.getState().queuedEventCount == 0 })
+    }
+
+    @Test func a401ThatNoFreshTokenResolvesBacksOff() async throws {
+        let app = TestApp()
+        app.timing = DeliveryTiming(flushAtEvents: 20, flushInterval: 0.3, maxRetryDelay: 5)
+        let fetches = Locked(0)
+        let kirora = app.start(
+            fetchUserToken: { fetches.withLock { $0 += 1 }; return userToken("user-1", issuedAt: 1_799_999_100) },
+            trackSessions: false
+        )
+        app.server.answer { $0.path.hasSuffix("/events/batch") ? .error(401, "UNAUTHORIZED") : nil }
+        try await kirora.identify(userToken("user-1"))
+        let fetchedAtSignIn = fetches.current
+        for index in 0..<45 { kirora.track("Event \(index)") }
+        await settle(0.5)
+        // Not a refused request and a token fetch for every 20 events: one, then the backoff.
+        #expect(app.server.batches.count <= 4)
+        #expect(fetches.current - fetchedAtSignIn <= 2)
+        #expect(kirora.getState().queuedEventCount == 45)
     }
 
     @Test func eventsSurviveARestart() async throws {

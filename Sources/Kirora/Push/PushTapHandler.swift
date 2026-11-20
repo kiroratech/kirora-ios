@@ -21,6 +21,9 @@ enum TrackingReport {
     }
 }
 
+/// Whether a push is Kirora's: it carries the `kirora` marker.
+func isKiroraPush(_ userInfo: [AnyHashable: Any]) -> Bool { userInfo["kirora"] != nil }
+
 /// A Kirora push's own keys, beside `aps`, whether it came through APNs or Firebase.
 ///
 /// A push is Kirora's only if it carries the `kirora` marker. `trackingUrl`, `actionUrl` and
@@ -42,9 +45,9 @@ struct KiroraPushPayload: Equatable, Sendable {
     }
 
     init?(userInfo: [AnyHashable: Any]) {
-        guard userInfo["kirora"] != nil else { return nil }
+        guard isKiroraPush(userInfo) else { return nil }
+        // Checked against the API's address when it's reported (`trustedTrackingUrl`).
         trackingUrl = (userInfo["trackingUrl"] as? String).flatMap(URL.init(string:))
-            .flatMap { ["https", "http"].contains($0.scheme?.lowercased() ?? "") ? $0 : nil }
         actionUrl = safeLink(userInfo["actionUrl"] as? String)
         buttons = Self.buttons(userInfo["buttons"])
     }
@@ -61,16 +64,21 @@ struct KiroraPushPayload: Equatable, Sendable {
     }
 
     /// `buttons` as Kirora sends it: JSON text (native pushes carry string data), or an array.
+    /// The same rule as the extension's `buttonTitles`, which shows them: positions must
+    /// agree, as an action names its button by position. So a button without a title means
+    /// none are shown, or read.
     private static func buttons(_ value: Any?) -> [Button] {
         var list: Any? = value
         if let text = value as? String, let data = text.data(using: .utf8) {
             list = try? JSONSerialization.jsonObject(with: data)
         }
         guard let items = list as? [[String: Any]] else { return [] }
-        return items.compactMap { item in
-            guard let title = item["title"] as? String else { return nil }
+        let buttons = items.compactMap { item -> Button? in
+            guard let title = item["title"] as? String, !title.isEmpty else { return nil }
             return Button(title: title, url: safeLink(item["url"] as? String))
         }
+        guard buttons.count == items.count else { return [] }
+        return Array(buttons.prefix(4))
     }
 }
 
@@ -88,6 +96,9 @@ struct PushTapHandler: Sendable {
     enum Action: Sendable, Equatable { case open, dismiss, button(String) }
 
     var transport: HTTPTransport = URLSessionTransport()
+    /// The API's address, which taps are reported under (`/t/p/…`) and nowhere else: the
+    /// app's `apiUrl`, waiting for a client if none exists yet. A fixed one in tests.
+    var apiBase: @Sendable () async -> URL = { await reportingApiBase(waitingUpTo: launchTapApiUrlWait) }
     /// Opens a link on the main thread. UIKit in the app; a fake in tests.
     var openURL: @Sendable (URL) async -> Void
 
@@ -104,8 +115,10 @@ struct PushTapHandler: Sendable {
         case .dismiss: link = nil
         }
         let transport = self.transport
+        let apiBase = self.apiBase
         let reporting = Task {
-            if let trackingUrl = payload.trackingUrl {
+            guard let candidate = payload.trackingUrl else { return }
+            if let trackingUrl = trustedTrackingUrl(candidate, apiBase: await apiBase()) {
                 await TrackingReport.post(link == nil ? "opened" : "clicked", to: trackingUrl, transport: transport)
             }
         }
@@ -116,6 +129,55 @@ struct PushTapHandler: Sendable {
         }
         await reporting.value
     }
+}
+
+/// The latest client's `apiUrl`, which push reports must go to.
+private let currentApiUrl = Locked<URL?>(nil)
+/// Opened once a client has set ``currentApiUrl``.
+private let apiUrlKnown = Gate()
+/// How long a tap heard before any client exists waits for one to learn the `apiUrl`.
+let launchTapApiUrlWait: Double = 10
+
+/// A client was created with `apiUrl`: taps are reported there from now on.
+func useApiUrlForReports(_ apiUrl: URL) {
+    currentApiUrl.withLock { $0 = apiUrl }
+    apiUrlKnown.open()
+}
+
+/// The API push reports go to: the latest client's `apiUrl`, else the one the app last
+/// created a client with (kept in the SDK's state file), else Kirora's. Before any client
+/// exists (a tap that launched the app), waits for one, `seconds` at most: the app may use
+/// another `apiUrl` than the one it remembered, as on its first launch after an update.
+func reportingApiBase(waitingUpTo seconds: Double) async -> URL {
+    await apiUrlKnown.wait(upTo: seconds)
+    return currentApiUrl.current
+        ?? KiroraEnvironment.liveStateStore().string(StorageKeys.apiUrl).flatMap(URL.init(string:))
+        ?? URL(string: ClientAPI.defaultApiUrl)!
+}
+
+/// `trackingUrl`, if it's a `/t/p/…` address on the API's own scheme, host and port (under
+/// its path, if `apiUrl` has one), as every Kirora SDK checks; nil for anywhere else. The
+/// extension has the same, word for word, as it can't depend on this target.
+func trustedTrackingUrl(_ trackingUrl: URL, apiBase: URL) -> URL? {
+    func port(_ components: URLComponents, _ scheme: String) -> Int? {
+        components.port ?? (scheme == "https" ? 443 : scheme == "http" ? 80 : nil)
+    }
+    // Under the API's own path, if it has one.
+    func prefix(_ base: URLComponents) -> String {
+        var path = base.percentEncodedPath
+        while path.hasSuffix("/") { path.removeLast() }
+        return path + "/t/p/"
+    }
+    guard let url = URLComponents(url: trackingUrl, resolvingAgainstBaseURL: false),
+          let base = URLComponents(url: apiBase, resolvingAgainstBaseURL: false),
+          let scheme = url.scheme?.lowercased(), scheme == base.scheme?.lowercased(),
+          let host = url.host?.lowercased(), !host.isEmpty, host == base.host?.lowercased(),
+          port(url, scheme) == port(base, scheme),
+          url.user == nil, url.password == nil,
+          url.percentEncodedPath.hasPrefix(prefix(base)),
+          !url.percentEncodedPath.split(separator: "/").contains(where: { $0 == ".." || $0 == "." })
+    else { return nil }
+    return trackingUrl
 }
 
 /// Taps the SDK has handled, so a tap passed to it twice (by its own delegate proxy and by

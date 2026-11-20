@@ -45,9 +45,8 @@ struct IdentityTests {
     }
 
     @Test func aFailingFetchUserTokenThrowsUserTokenError() async {
-        struct Down: Error {}
         let app = TestApp()
-        let kirora = app.start(fetchUserToken: { throw Down() })
+        let kirora = app.start(fetchUserToken: { throw TokenServerDown() })
         await #expect(throws: UserTokenError.self) { try await kirora.identify() }
     }
 
@@ -65,7 +64,7 @@ struct IdentityTests {
 
     @Test func a401AsksForAFreshTokenOnceAndRetries() async throws {
         let app = TestApp()
-        let fresh = userToken("user-1", issuedAt: 1_700_000_100)
+        let fresh = userToken("user-1", issuedAt: 1_799_999_100)
         let calls = Locked(0)
         let kirora = app.start(fetchUserToken: {
             calls.withLock { $0 += 1 }
@@ -153,5 +152,114 @@ struct LogoutTests {
         try await kirora.identify(userToken("user-1"))
         await kirora.logout()
         await kirora.logout()
+    }
+
+    // MARK: Refreshing before expiry (spec, 20 November)
+
+    @Test func aTokenIsRefreshed60SecondsBeforeItExpires() async throws {
+        let app = TestApp()
+        let fresh = userToken("user-1", issuedAt: 1_800_000_000, expiresIn: 7200)
+        let calls = Locked(0)
+        let kirora = app.start(fetchUserToken: { calls.withLock { $0 += 1 }; return fresh }, trackSessions: false)
+        // Expires 61 seconds from the clock's now: refreshed in about a second.
+        try await kirora.identify(userToken("user-1", issuedAt: 1_800_000_000, expiresIn: 61))
+        #expect(calls.current == 0)
+        #expect(await eventually(3) { calls.current == 1 })
+        // Called; the token it answered is kept as it returns.
+        await settle(0.05)
+        kirora.track("After")
+        await kirora.flush()
+        #expect(app.server.batches.last?.token == fresh)
+        // The fresh one is two hours off: not asked again.
+        await settle()
+        #expect(calls.current == 1)
+    }
+
+    @Test func aTokenThatExpiredWhileInTheBackgroundIsRefreshedOnReturning() async throws {
+        let app = TestApp()
+        let fresh = userToken("user-1", issuedAt: 1_800_003_600)
+        let calls = Locked(0)
+        let kirora = app.start(fetchUserToken: { calls.withLock { $0 += 1 }; return fresh }, trackSessions: false)
+        try await kirora.identify(userToken("user-1", issuedAt: 1_800_000_000))
+        app.lifecycle.fire(.background)
+        app.clock.advance(3600)
+        app.lifecycle.fire(.foreground)
+        #expect(await eventually { calls.current == 1 })
+        await settle(0.05)
+        kirora.track("After")
+        await kirora.flush()
+        #expect(app.server.batches.last?.token == fresh)
+    }
+
+    @Test func aTokenFetchedTooCloseToItsExpiryIsNotFetchedAgainAndAgain() async throws {
+        let app = TestApp()
+        let calls = Locked(0)
+        let kirora = app.start(fetchUserToken: {
+            calls.withLock { $0 += 1 }
+            // A server handing out tokens that expire in 30 seconds.
+            return userToken("user-1", issuedAt: 1_800_000_000 + calls.current, expiresIn: 30)
+        })
+        try await kirora.identify()
+        await settle(0.3)
+        // The sign-in's, and one refresh at once, as it's already due.
+        #expect(calls.current <= 2)
+    }
+
+    @Test func withoutFetchUserTokenNothingIsRefreshed() async throws {
+        let app = TestApp()
+        let kirora = app.start(trackSessions: false)
+        try await kirora.identify(userToken("user-1", issuedAt: 1_800_000_000, expiresIn: 30))
+        kirora.track("One")
+        await kirora.flush()
+        #expect(app.server.batches.last?.token == userToken("user-1", issuedAt: 1_800_000_000, expiresIn: 30))
+    }
+
+    @Test func noRefreshAfterSigningOut() async throws {
+        let app = TestApp()
+        let calls = Locked(0)
+        let kirora = app.start(fetchUserToken: { calls.withLock { $0 += 1 }; return userToken("user-1") })
+        try await kirora.identify(userToken("user-1", issuedAt: 1_800_000_000, expiresIn: 61))
+        await kirora.logout()
+        await settle(1.5)
+        #expect(calls.current == 0)
+    }
+
+    /// No request may follow to report it: an expired token that can't be refreshed is told
+    /// to the app by itself, once.
+    @Test func anExpiredTokenThatCantBeRefreshedIsFetchFailed() async throws {
+                let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let kirora = app.start(
+            fetchUserToken: { throw TokenServerDown() },
+            onAuthenticationFailed: { reason in reasons.withLock { $0.append(reason) } }, trackSessions: false
+        )
+        // Expired 400 seconds before the clock's now.
+        try await kirora.identify(userToken("user-1", issuedAt: 1_799_996_000))
+        #expect(await eventually { reasons.current == [.fetchFailed] })
+        app.lifecycle.fire(.foreground)
+        await settle()
+        #expect(reasons.current == [.fetchFailed])
+    }
+
+    @Test func aRefreshAheadOfExpiryThatFailsIsNotReportedYet() async throws {
+                let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let calls = Locked(0)
+        let kirora = app.start(
+            fetchUserToken: { calls.withLock { $0 += 1 }; throw TokenServerDown() },
+            onAuthenticationFailed: { reason in reasons.withLock { $0.append(reason) } }, trackSessions: false
+        )
+        // Within the 60 seconds before expiry: refreshed at once, but still valid.
+        try await kirora.identify(userToken("user-1", issuedAt: 1_800_000_000, expiresIn: 30))
+        #expect(await eventually { calls.current == 1 })
+        await settle()
+        #expect(reasons.current.isEmpty)
+    }
+
+    @Test func readsTheTokensExpiry() {
+        #expect(SignedInUser(token: userToken("u", issuedAt: 1_800_000_000, expiresIn: 60)).tokenAndExpiry.expiry
+            == Date(timeIntervalSince1970: 1_800_000_060))
+        #expect(SignedInUser(token: "not.a.token").tokenAndExpiry.expiry == nil)
+        #expect(SignedInUser(token: "").tokenAndExpiry.expiry == nil)
     }
 }

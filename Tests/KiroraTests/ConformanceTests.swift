@@ -617,7 +617,7 @@ struct ButtonTests {
     @Test func aTappedButtonOpensItsLinkAndCountsAsAClick() async {
         let server = FakeKirora()
         let opened = Locked<[URL]>([])
-        let handler = PushTapHandler(transport: server, openURL: { url in opened.withLock { $0.append(url) } })
+        let handler = PushTapHandler(transport: server, apiBase: { testApiBase }, openURL: { url in opened.withLock { $0.append(url) } })
         let payload = KiroraPushPayload(userInfo: [
             "kirora": "true", "trackingUrl": "https://api.test.kirora.io/t/p/abc", "actionUrl": "myapp://home",
             "buttons": #"[{"title":"Track order","url":"myapp://orders/1"},{"title":"Later"}]"#,
@@ -700,6 +700,33 @@ struct FailingStorageTests {
         #expect(file.writeFailed)
         queue.add(event("Second"), owner: "u")
         #expect(queue.oldest(10, owner: "u").map(\.name) == ["First", "Second"])
+    }
+
+    @Test func aRefusalThatCantBeSavedWinsOverTheStaleGrantWithoutDeletingIt() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("kirora-readonly-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let stateFile = PersistentFile(url: directory.appendingPathComponent("state.json"), onError: { _ in })
+        let consentFile = PersistentFile(url: directory.appendingPathComponent("consent.json"), onError: { _ in })
+        let consent = TrackingConsent(
+            store: FileKeyValueStore(file: stateFile), refusals: FileKeyValueStore(file: consentFile), required: false
+        )
+        _ = consent.answer(true)
+        stateFile.waitForWrites()
+        // Storage stops taking writes: the refusal stays in memory only.
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: directory.path)
+        _ = consent.answer(false)
+        stateFile.waitForWrites()
+        consentFile.waitForWrites()
+        #expect(stateFile.writeFailed)
+        #expect(consent.allowed == false)
+        #expect(consent.refused)
+        // The stale grant is ignored, never deleted: reading changed nothing on disk.
+        let saved = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: stateFile.url))
+        #expect(saved[StorageKeys.trackingConsent] == "granted")
     }
 }
 
@@ -916,7 +943,8 @@ struct ReviewFixTests {
         try await kirora.identify(userToken("u"))
         let started = Date()
         kirora.track("First")
-        #expect(Date().timeIntervalSince(started) < 1)
+        // Frozen, it would wait out the hook's 2 seconds; a busy machine may take over 1.
+        #expect(Date().timeIntervalSince(started) < 1.5)
         await kirora.flush()
         #expect(Set(app.server.sentEventNames) == ["First", "Second"])
         client.withLock { $0 = nil }
@@ -1398,5 +1426,160 @@ struct EventContextTests {
         #expect(context["screen"] == nil)
         #expect(context["sessionId"] == nil)
         #expect(context["app"]?["name"] == nil)
+    }
+}
+
+@Suite("onAuthenticationFailed")
+struct AuthenticationFailedTests {
+    /// Starts a client whose failures land in `reasons`.
+    private func start(
+        _ app: TestApp, fetch: (@Sendable () async throws -> String)?, push: PushOptions? = nil,
+        reasons: Locked<[AuthenticationFailureReason]>
+    ) -> Kirora {
+        app.start(
+            fetchUserToken: fetch, onAuthenticationFailed: { reason in reasons.withLock { $0.append(reason) } },
+            push: push, trackSessions: false
+        )
+    }
+
+    @Test func aTokenThatCantBeFetchedWhileSendingIsFetchFailed() async throws {
+        let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let kirora = start(app, fetch: { throw TokenServerDown() }, reasons: reasons)
+        try await kirora.identify(userToken("u"))
+        app.server.answer { $0.path == "/client/v1/events/batch" ? .error(401, "UNAUTHORIZED") : nil }
+        kirora.track("Viewed")
+        await kirora.flush()
+        #expect(await eventually { !reasons.current.isEmpty })
+        // Retries that fail again don't tell the app again.
+        await settle(0.5)
+        #expect(app.server.batches.count > 1)
+        #expect(reasons.current == [.fetchFailed])
+    }
+
+    @Test func aFreshTokenKiroraRefusesWhileSendingIsRefused() async throws {
+        let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let kirora = start(app, fetch: { userToken("u", issuedAt: 1_799_999_100) }, reasons: reasons)
+        try await kirora.identify(userToken("u"))
+        app.server.answer { $0.path == "/client/v1/events/batch" ? .error(401, "UNAUTHORIZED") : nil }
+        kirora.track("Viewed")
+        await kirora.flush()
+        #expect(await eventually { !reasons.current.isEmpty })
+        await settle()
+        #expect(reasons.current == [.refused])
+        // The fresh token was tried.
+        #expect(app.server.batches.contains { $0.token == userToken("u", issuedAt: 1_799_999_100) })
+    }
+
+    @Test func aRefusedTokenWithNoFetchUserTokenIsRefused() async throws {
+        let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let kirora = start(app, fetch: nil, reasons: reasons)
+        try await kirora.identify(userToken("u"))
+        app.server.answer { $0.path == "/client/v1/events/batch" ? .error(401, "UNAUTHORIZED") : nil }
+        kirora.track("Viewed")
+        await kirora.flush()
+        #expect(await eventually { reasons.current == [.refused] })
+    }
+
+    @Test func tellsAgainOnlyAfterASuccessOrANewIdentify() async throws {
+        let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let refusing = Locked(true)
+        let kirora = start(app, fetch: nil, reasons: reasons)
+        try await kirora.identify(userToken("u"))
+        app.server.answer { $0.path == "/client/v1/events/batch" && refusing.current ? .error(401, "UNAUTHORIZED") : nil }
+        kirora.track("One")
+        await kirora.flush()
+        kirora.track("Two")
+        await kirora.flush()
+        #expect(await eventually { reasons.current.count == 1 })
+        await settle()
+        #expect(reasons.current.count == 1)
+        // A request that succeeds (after identify(), as nothing is sent until then with no
+        // fetchUserToken): the next failure is told.
+        refusing.withLock { $0 = false }
+        try await kirora.identify(userToken("u"))
+        kirora.track("Three")
+        await kirora.flush()
+        #expect(await eventually { app.server.sentEventNames.contains("Three") })
+        refusing.withLock { $0 = true }
+        kirora.track("Four")
+        await kirora.flush()
+        #expect(await eventually { reasons.current.count == 2 })
+        // A new identify(): told again.
+        try await kirora.identify(userToken("u"))
+        kirora.track("Five")
+        await kirora.flush()
+        #expect(await eventually { reasons.current.count == 3 })
+    }
+
+    @Test func notForAFailureIdentifyThrows() async throws {
+        let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let kirora = start(app, fetch: { throw TokenServerDown() }, push: .enabled, reasons: reasons)
+        app.server.answer { $0.path == "/client/v1/push-app" ? .error(401, "UNAUTHORIZED") : nil }
+        await #expect(throws: UserTokenError.self) { try await kirora.identify(userToken("u")) }
+        await settle()
+        #expect(reasons.current.isEmpty)
+    }
+
+    /// The events identify() sends may be refused for the same token its push registration
+    /// is: identify() throws it, so the app isn't told twice.
+    @Test func notForTheSameFailureWhileIdentifyThrowsIt() async throws {
+        for _ in 0..<5 {
+            let app = TestApp()
+            let reasons = Locked<[AuthenticationFailureReason]>([])
+            // Notifications allowed only later, so the second sign-in registers.
+            app.push.status.withLock { $0 = .notDetermined }
+            let kirora = start(app, fetch: nil, push: .enabled, reasons: reasons)
+            try await kirora.identify(userToken("u"))
+            await kirora.flush()
+            // The user's own event, waiting; then their token is revoked.
+            app.server.answer { _ in .networkError }
+            kirora.track("Waiting")
+            await kirora.flush()
+            let before = app.server.batches.count
+            app.push.status.withLock { $0 = .authorized }
+            app.server.answer { request in
+                switch request.path {
+                case "/client/v1/events/batch": return .error(401, "UNAUTHORIZED")
+                // Refused after the events, so their failure comes first.
+                case "/client/v1/push-app":
+                    var refused = FakeAnswer.error(401, "UNAUTHORIZED")
+                    refused.delay = 0.2
+                    return refused
+                default: return nil
+                }
+            }
+            await #expect(throws: KiroraApiError.self) { try await kirora.identify(userToken("u", issuedAt: 1_799_999_100)) }
+            #expect(await eventually { app.server.batches.count > before })
+            await settle()
+            #expect(reasons.current.isEmpty)
+        }
+    }
+
+    @Test func notForAFailureSetPushConsentThrows() async throws {
+        let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let kirora = start(app, fetch: { userToken("u", issuedAt: 1_799_999_100) }, reasons: reasons)
+        try await kirora.identify(userToken("u"))
+        app.server.answer { $0.path == "/client/v1/push-consent" ? .error(401, "UNAUTHORIZED") : nil }
+        await #expect(throws: KiroraApiError.self) { try await kirora.setPushConsent(true) }
+        await settle()
+        #expect(reasons.current.isEmpty)
+    }
+
+    @Test func notForAUserWhoHasSignedOut() async throws {
+        let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let kirora = start(app, fetch: { throw TokenServerDown() }, reasons: reasons)
+        try await kirora.identify(userToken("u"))
+        app.server.answer { $0.path == "/client/v1/events/batch" ? .error(401, "UNAUTHORIZED") : nil }
+        kirora.track("Viewed")
+        await kirora.logout()
+        await settle()
+        #expect(reasons.current.isEmpty)
     }
 }

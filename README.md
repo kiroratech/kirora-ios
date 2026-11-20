@@ -170,7 +170,17 @@ try await kirora.identify(token) // Uses a token you already obtained.
 
 The SDK sends no anonymous behavioural requests. Events tracked before identification, while tracking is allowed, wait on the device for the next user. Once adopted, they retain that user's identity across retries and restarts. Events captured while A is signed in never become B's events. If a never-accepted token is refused, its adopted pre-sign-in events can be released for a later sign-in.
 
-An authenticated request that receives `401` can refresh its token once through `fetchUserToken`. A replacement must name the same user. Tokens stay in memory; they are not written into queued events.
+With `fetchUserToken`, the SDK asks for a fresh token 60 seconds before the current one's `exp`, when the app returns to the foreground after it has expired, and once when a request receives `401`. A replacement must name the same user. Tokens stay in memory; they are not written into queued events.
+
+A `401` that no fresh token resolves keeps the events. With `fetchUserToken`, sending backs off (to about five minutes) instead of asking for a token on every attempt; without it, nothing is sent as that token again. Either way, the next `identify()` sends them.
+
+When the token fails in the background (sending events, registering for push), `onAuthenticationFailed` is called on the main thread with `.fetchFailed` (`fetchUserToken` threw or timed out) or `.refused` (Kirora answered `401` and no fresh token was accepted: refused too, or none to try, without `fetchUserToken`). It's called once per failure, not per retry: again only after a request succeeds or another `identify()`. It isn't called for a failure `identify()` or `setPushConsent(_:)` throws, or while the user is signing out. Sign the user out, or ask them to sign in again:
+
+```swift
+onAuthenticationFailed: { reason in
+    AuthSession.shared.expire()   // Your app's own sign-in flow.
+}
+```
 
 With push disabled, `identify(token)` selects the token locally. Server acceptance is established by a subsequent authenticated request, not by that method returning alone.
 
@@ -225,7 +235,8 @@ With `trackAppLifecycle: true`, the SDK also records `Application Installed`, `A
 ### Delivery and storage
 
 - Delivery starts at 20 queued events, otherwise after about 30 seconds, and is attempted on backgrounding and connectivity recovery.
-- Batches hold at most 100 events and target 200,000 encoded bytes. Oversized or invalid batches are split to isolate an event the server refuses.
+- Batches hold at most 100 events and target 200,000 encoded bytes. A batch that is too large (`413`) or invalid (`422`, or a `400` whose `errors` name a field under `events`) is split to isolate the event at fault, which alone is dropped. A `400` naming only other fields (a refused header), or none (a proxy's page), is kept and retried.
+- A refusal of the whole request that no event caused (a redirect, `403`, `404`, `409`, or a `400` naming a header), as a wrong `apiUrl`, a proxy or a captive portal answers, keeps the events and backs off like a network failure. `403 PLAN_FEATURE_UNAVAILABLE` drops the batch: the plan doesn't take those events.
 - The disk queue holds at most 1,000 events and 1,000,000 encoded bytes, including ownership metadata. Oldest records are dropped when either budget is exceeded.
 - Network failures and retryable responses back off exponentially to about five minutes, with jitter. `Retry-After` is honoured; unusually large values are capped at one week.
 - Each event retains its idempotency key and capture time on retry. A batch's `sentAt` lets the API correct device-clock skew for behavioural events.
@@ -290,11 +301,22 @@ try await kirora.setPushConsent(true) // Signed-in user's marketing choice.
 
 Kirora handles only notifications carrying the top-level `kirora` marker. Test notifications without `trackingUrl` produce no reports. Taps post `opened`, or `clicked` when the tapped notification/button has a link. Dismissals are not opens.
 
-A Kirora notification is presented in the foreground unless your own notification delegate implements `willPresent` and chooses otherwise. The automatic integration forwards notification callbacks to the app's delegate.
+A Kirora notification is presented in the foreground unless your own notification delegate implements `willPresent` and chooses otherwise. The automatic integration forwards notification callbacks to the app's delegate. A delegate that leaves a Kirora push unanswered (some libraries ignore notifications they didn't schedule, without calling the completion handler) has it shown for it after 1.5 seconds, instead of it being dropped; answer `[]` to hide one.
 
 Use `handleDeepLink` for explicit routing. It runs on the main actor and returns `true` when your app handled the URL. Return `false` for SDK default routing. By default a web link goes to your app delegate's `application(_:continue:restorationHandler:)` and stays in the app if that returns `true`; anything else, custom schemes included, opens with `UIApplication.open` (the browser, or whichever app owns the link). A scene delegate is never handed a link, as `scene(_:continue:)` can't report whether it took it: **in a scene-based app, claim your own universal links in `handleDeepLink`**, or they open in the browser. Links using `javascript:`, `data:`, `file:` or `vbscript:` are rejected.
 
-Button payload parsing does not create iOS action buttons. Categories/actions must be configured by the app, and the notification needs a matching category identifier. For an existing action, Kirora maps its identifier to the button index (`"0"`, `"1"`) or button title. Coordinate category assignment with your notification extension/payload; the standard Kirora sender and extension do not configure it automatically.
+**Buttons need the Notification Service Extension** ([below](#delivery-reports-and-images)): iOS shows buttons only from a notification category, which the extension makes from the push's `buttons` and adds to the app's own categories. Without it, a Kirora push shows no buttons. A button opens the app; the SDK reports `clicked` and opens the button's link as it does for the notification's. If your app calls `setNotificationCategories` at launch, it replaces Kirora's categories then: buttons on pushes already delivered disappear (new pushes register theirs again). A push whose payload already names a `category` keeps it.
+
+To hear taps in your own code, with the push's data:
+
+```swift
+Kirora.addNotificationClickListener { tap in
+    // tap.data: the push's keys, your own data included. tap.buttonIndex: nil for the
+    // notification itself. tap.link: the link the SDK opened, if any.
+}
+```
+
+It may be added before the client exists, and is called on the main thread after the tap is reported and its link opened. A tap heard before any listener (the one that launched the app) is held, the latest ten, for the first listener added. Keep the returned registration to `remove()` it later.
 
 ### Manual integration
 
@@ -342,11 +364,13 @@ final class NotificationService: KiroraNotificationServiceExtension {}
 
 Keep the generated extension configuration and principal-class entry. Set a compatible deployment target. Kirora supplies `mutable-content: 1`; custom payloads must also satisfy Apple's notification-extension requirements.
 
-The helper attempts a delivery report and downloads an HTTPS image before finishing. It needs neither a client key nor an App Group: reporting credentials are carried by the notification's `trackingUrl`. The report retries once on network errors, `429` or `5xx`, then is dropped. Reports are best effort and are not recovered through shared App Group storage. Extension expiry hands the available content back to iOS.
+The helper attempts a delivery report, downloads an HTTPS image and registers the push's buttons before finishing. It needs neither a client key nor an App Group: reporting credentials are carried by the notification's `trackingUrl`. The report retries once on network errors, `429` or `5xx`, then is dropped. Reports are best effort and are not recovered through shared App Group storage. Extension expiry hands the available content back to iOS.
 
 For an existing extension, call `KiroraNotificationService.didReceive(_:withContentHandler:)`. If it returns `false`, handle that notification yourself and call its content handler. Forward `serviceExtensionTimeWillExpire()` to Kirora too. Keep other providers' extension processing intact.
 
-Without the extension, iOS delivered reports and Kirora image attachments are unavailable. Taps are still handled by the app.
+Reports go only to a `/t/p/…` address on Kirora's API host (under its path, if `apiUrl` has one), as in the app. The extension can't see the app's options: if the app sets `apiUrl`, add a `KiroraApiUrl` string with the same address to the **extension's** Info.plist.
+
+Without the extension, iOS delivered reports, Kirora image attachments and buttons are unavailable. Taps are still handled by the app.
 
 ## API reference
 
@@ -361,6 +385,7 @@ Without the extension, iOS delivered reports and Kirora image attachments are un
 | `trackSessions` | `true` | Session events and `context.sessionId` |
 | `trackAppLifecycle` | `false` | Automatic application lifecycle events |
 | `logLevel` | `.error` | `.none`, `.error` or `.debug` |
+| `onAuthenticationFailed` | `nil` | `@MainActor @Sendable (AuthenticationFailureReason) -> Void`; the user's token failed in the background |
 | `handleDeepLink` | `nil` | `@MainActor @Sendable (URL) -> Bool`; explicit push-link routing |
 | `apiUrl` | `https://api.kirora.io` | API origin for staging/private deployments |
 | `beforeSend` | `nil` | Synchronous redaction/drop hook before behavioural storage |
@@ -378,9 +403,11 @@ Without the extension, iOS delivered reports and Kirora image attachments are un
 | `getPushStatus() async -> PushStatus` | Reads OS permission and registration status; never prompts |
 | `setPushEnabled(_ enabled: Bool) async` | Changes this device's push preference; never throws |
 | `setPushConsent(_ granted: Bool) async throws` | Records the signed-in user's marketing choice |
+| `trackingConsent: Bool` | Whether tracking is allowed now; as `getState().trackingConsent`, without reading the rest |
 | `getState() -> KiroraState` | Local diagnostic snapshot; no prompt or network request |
 | `flush() async` | Attempts queued delivery without bypassing consent or `Retry-After` |
 | `destroy()` | Stops the client; queued events remain for a future client |
+| `Kirora.addNotificationClickListener(_:) -> KiroraListenerRegistration` | Static. Hears taps on Kirora pushes and buttons, on the main thread; held taps go to the first listener |
 
 `KiroraState` exposes `isInitialized`, `isIdentified`, `deviceId`, `sessionId`, `pushToken`, `trackingConsent`, `pushConsent` and `queuedEventCount`. It is for diagnostics, not proof of server acceptance or authorisation to send marketing push. `pushToken` is the token of the signed-in user's current registration, and `nil` before sign-in, after a failed registration, while push is off or while it's being detached.
 
@@ -403,8 +430,9 @@ Files live under `Application Support/io.kirora.sdk/`. The directory is excluded
 | Storage | Contents |
 | --- | --- |
 | `events-<hash>.json` | Bounded queued event snapshots, owners and idempotency keys |
-| `state.json` | Namespaced installation/session state, preferences, last registration, app version and pending influenced opens; APNs cache |
+| `state.json` | Namespaced installation/session state, preferences, last registration, app version and pending influenced opens; APNs cache; the last `apiUrl`, for a tap that launches the app before the client exists |
 | `consent.json` | Independent tracking-refusal copy |
+| Extension's `UserDefaults` | The order of Kirora's button categories, so the least recently used go first (declared in the extension's privacy manifest) |
 | Memory | User JWTs, active requests and detach retry credentials |
 
 Push registration metadata, notification receipts and taps are operational reports. Influenced app opens require behavioural tracking permission, a signed-in user and a push registration. They are separate from `Application Opened` events and can be reported even with lifecycle-event tracking disabled. Up to 50 pending opens are retained; those older than seven days are discarded. Their 30-minute spacing is saved with the visit; with `trackSessions: false` it's kept in memory only.
@@ -431,7 +459,8 @@ Both products include a `PrivacyInfo.xcprivacy` manifest. Review your app's comp
 | Permission granted but status disabled | Identify the user, enable device push and inspect registration/network errors. |
 | No image or delivered metric | Extension target/product/configuration, valid payload and connectivity; dashboard tests may not carry tracking URLs. |
 | Link does not open in the app | In a scene-based app, claim your own universal links in `handleDeepLink`; otherwise they open in the browser. |
-| No action buttons | Notification categories and category assignment; parsing a `buttons` field alone is insufficient. |
+| No action buttons | The Notification Service Extension, which makes the buttons; and that the app doesn't replace notification categories after the push arrived. |
+| No tap or delivered reports with a custom `apiUrl` | Reports go only to `/t/p/…` on the API host: set `KiroraApiUrl` in the extension's Info.plist. |
 
 ## Support and contributing
 

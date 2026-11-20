@@ -16,8 +16,6 @@ let eventBatchSize = 100
 private let maxBatchBytes = 200_000
 /// `{"sentAt":"…","events":[]}` around the events.
 private let envelopeBytes = 64
-/// Answers that blame something in the batch: halving it finds the event to drop.
-private let splitStatuses: Set<Int> = [400, 413, 422]
 /// Per-event codes that may succeed later: the event stays queued for a retry.
 private let transientEventCodes: Set<String> = ["RATE_LIMITED", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"]
 
@@ -90,7 +88,7 @@ actor EventDelivery {
 
     /// After an event is queued: send at once if enough wait, otherwise soon.
     func onEventQueued(waiting: Int) {
-        guard identity.user != nil, !destroyed else { return }
+        guard let user = identity.user, !user.tokenRefused, !destroyed else { return }
         if waiting >= timing.flushAtEvents {
             Task { await self.flushWhenDue() }
         } else {
@@ -181,7 +179,7 @@ actor EventDelivery {
     }
 
     private func mayStillSend(as user: SignedInUser) -> Bool {
-        identity.user === user && !destroyed && consentAllowed()
+        identity.user === user && !user.tokenRefused && !destroyed && consentAllowed()
     }
 
     private enum Outcome {
@@ -204,12 +202,17 @@ actor EventDelivery {
             log.debug("Sent \(settled.count) events")
             return .settled(settled)
         } catch {
-            return classifyFailure(error, batchKeys: keys)
+            return classifyFailure(error, batchKeys: keys, as: user)
         }
     }
 
     /// What a failed batch means: try later, stop, split it, or drop it as refused.
-    private func classifyFailure(_ error: Error, batchKeys: Set<String>) -> Outcome {
+    ///
+    /// Only an answer that blames the events drops any: halving the batch finds the event,
+    /// which is dropped alone. A refusal of the whole request (a wrong `apiUrl`, a captive
+    /// portal or proxy answering 3xx, 403, 404 or 409, a bad `Kirora-SDK` header) would refuse
+    /// every event alike, so the events stay and sending backs off.
+    private func classifyFailure(_ error: Error, batchKeys: Set<String>, as user: SignedInUser) -> Outcome {
         // Cancelled on purpose: the events stay, with nothing scheduled.
         if Task.isCancelled { return .stop }
         guard let apiError = error as? KiroraApiError, !apiError.isRetryable else {
@@ -218,18 +221,44 @@ actor EventDelivery {
             schedule(backoff.failed(error))
             return .stop
         }
-        // Still refused after a token refresh, or the user changed: keep the events for the
-        // next identify() as their own user.
+        // Refused even after a token refresh, or with none to try: the events stay for this
+        // user, or the next identify() as their own. Retrying at once would only be refused
+        // again (and ask fetchUserToken again), so: with no fetchUserToken, nothing goes until
+        // identify() signs in again; with one, sending backs off, and identify() resumes it.
         if apiError.status == 401 {
             log.error("Events not sent", apiError)
+            if !user.tokenRefused { schedule(backoff.failed(apiError)) }
             return .stop
         }
-        // Too large or invalid: retry in halves until the bad event is alone, so the rest of
-        // the batch still goes.
-        if splitStatuses.contains(apiError.status), batchKeys.count > 1 { return .split }
-        // Any other 4xx will fail every time, so drop the batch instead of blocking the queue.
-        log.error("Events dropped: Kirora refused them", apiError)
-        return .settled(batchKeys)
+        if blamesEvents(apiError) {
+            // Retry in halves until the bad event is alone, so the rest of the batch still goes.
+            if batchKeys.count > 1 { return .split }
+            log.error("Event dropped: Kirora refused it", apiError)
+            return .settled(batchKeys)
+        }
+        // The plan doesn't take these events: a terminal refusal of the feature.
+        if apiError.status == 403, apiError.code == "PLAN_FEATURE_UNAVAILABLE" {
+            log.error("Events dropped: Kirora refused them", apiError)
+            return .settled(batchKeys)
+        }
+        log.error("Events not sent; kept for a retry", apiError)
+        schedule(backoff.failed(apiError))
+        return .stop
+    }
+
+    /// Too large, or invalid for a reason an event names: halving the batch finds it, and
+    /// drops only it. A 400 whose `errors` name no body field under `events` (a refused
+    /// `Kirora-SDK` header), or that has no `errors` (a proxy's page), is a problem with the
+    /// request, which each event alone would meet just the same: not split, kept.
+    private func blamesEvents(_ error: KiroraApiError) -> Bool {
+        switch error.status {
+        case 413, 422: return true
+        case 400:
+            return error.fields.contains { part, field in
+                (part == nil || part == "body") && (field == "events" || field.hasPrefix("events."))
+            }
+        default: return false
+        }
     }
 
     /// The events Kirora settled: accepted, or refused for good (logged by code only, never

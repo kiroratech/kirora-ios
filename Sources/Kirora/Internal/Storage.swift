@@ -72,6 +72,9 @@ enum StorageKeys {
     static let pushConsent = "push-consent"
     /// The APNs device token iOS last gave: one per app, whichever workspace asks.
     static let apnsToken = "apns-token"
+    /// The `apiUrl` the app last created a client with: one per app, for push taps heard
+    /// before a client exists.
+    static let apiUrl = "api-url"
     /// Who this device was last registered for push as, per workspace.
     static func pushRegistration(_ namespace: String) -> String { "push-registration:\(namespace)" }
     /// App opens waiting to be reported, per workspace.

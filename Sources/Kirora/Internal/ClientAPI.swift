@@ -55,7 +55,10 @@ struct URLSessionTransport: HTTPTransport {
 final class ClientAPI: Sendable {
     static let defaultApiUrl = "https://api.kirora.io"
 
-    /// Nil if `apiUrl` isn't an address: then every request fails with `urlProblem`.
+    /// `apiUrl`, without a trailing slash, if it's an address. Nil: every request fails with
+    /// `urlProblem`.
+    let apiUrl: URL?
+    /// `/client/v1` under `apiUrl`.
     private let baseURL: URL?
     private let clientKey: String
     private let identity: Identity
@@ -79,15 +82,16 @@ final class ClientAPI: Sendable {
         let url = URL(string: trimmed)
         if let url, let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
            let host = url.host, !host.isEmpty {
-            baseURL = url.appendingPathComponent("client/v1")
+            self.apiUrl = url
             urlProblem = nil
             namespace = "\(clientKey)@\(host)\(url.port.map { ":\($0)" } ?? "")"
         } else {
-            baseURL = nil
+            self.apiUrl = nil
             urlProblem = "apiUrl must be an address like \(Self.defaultApiUrl)"
             // A malformed apiUrl still gets a namespace of its own, never a real workspace's.
             namespace = "\(clientKey)@\(apiUrl)"
         }
+        baseURL = self.apiUrl?.appendingPathComponent("client/v1")
     }
 
     /// Sends as `user`, or whoever is signed in now. On a 401 it asks for a fresh token
@@ -113,17 +117,31 @@ final class ClientAPI: Sendable {
         } catch let refused as KiroraApiError where refused.status == 401 && refreshing {
             // Kirora refused the token: get a fresh one, once, and try again with it. (A
             // detachment doesn't: it uses the outgoing user's token as captured.)
-            guard let freshToken = try await identity.refresh(user, refusedToken: sentToken) else {
-                onTokenRefused.current?(user)
-                throw refused
+            let freshToken: String?
+            do {
+                freshToken = try await identity.refresh(user, refusedToken: sentToken)
+            } catch let failed as UserTokenError {
+                identity.reportFailure(.fetchFailed, as: user)
+                throw failed
+            }
+            guard let freshToken else {
+                // No fresh token to try: no fetchUserToken, or it named someone else.
+                throw tokenRefused(refused, as: user)
             }
             do {
                 return try await send(request, token: freshToken, as: user)
             } catch let again as KiroraApiError where again.status == 401 {
-                onTokenRefused.current?(user)
-                throw again
+                throw tokenRefused(again, as: user)
             }
         }
+    }
+
+    /// Kirora refused `user`'s token for good, even after a refresh: tells whoever listens,
+    /// and returns the refusal to throw.
+    private func tokenRefused(_ refusal: KiroraApiError, as user: SignedInUser) -> KiroraApiError {
+        onTokenRefused.current?(user)
+        identity.reportFailure(.refused, as: user)
+        return refusal
     }
 
     /// One call; Kirora's answer to it is `user`'s token accepted. A 401 is thrown like any
@@ -161,11 +179,20 @@ final class ClientAPI: Sendable {
 
 private func apiError(_ response: HTTPURLResponse, _ data: Data) -> KiroraApiError {
     let error = (try? JSONDecoder().decode(JSONValue.self, from: data))?["error"]
+    // `errors`: `{ in?, field, code, message }` for each field a 400 refused.
+    var fields: [(part: String?, field: String)] = []
+    if case .array(let fieldErrors)? = error?["errors"] {
+        for fieldError in fieldErrors {
+            guard let field = fieldError["field"]?.stringValue else { continue }
+            fields.append((fieldError["in"]?.stringValue, field))
+        }
+    }
     return KiroraApiError(
         status: response.statusCode,
         code: error?["code"]?.stringValue,
         message: error?["message"]?.stringValue ?? "Kirora answered \(response.statusCode)",
-        retryAfterMs: retryAfterMs(response.value(forHTTPHeaderField: "Retry-After"))
+        retryAfterMs: retryAfterMs(response.value(forHTTPHeaderField: "Retry-After")),
+        fields: fields
     )
 }
 

@@ -162,7 +162,9 @@ struct PushRegistrationTests {
 
     @Test func logoutWaitsAtMostItsLimitThenForgetsTheUser() async throws {
         let app = TestApp()
-        app.logoutWait = 0.2
+        // Room for the detach to start before the deadline on a busy machine: one that starts
+        // after it goes without one, and isn't what this checks.
+        app.logoutWait = 0.4
         let kirora = app.start(push: .enabled)
         try await kirora.identify(userToken("user-1"))
         app.server.answer { $0.method == "DELETE" ? FakeAnswer(status: 204, body: nil, delay: 2) : nil }
@@ -176,7 +178,7 @@ struct PushRegistrationTests {
         #expect(!app.server.sentEventNames.contains("After Logout"))
         // The request still under way at the deadline was cancelled, and the detachment
         // carries on in the background.
-        #expect(app.server.requests.filter { $0.method == "DELETE" }.count >= 2)
+        #expect(await eventually { app.server.requests.filter { $0.method == "DELETE" }.count >= 2 })
     }
 
     @Test func logoutCancelsASendStillUnderWayAtItsDeadline() async throws {
@@ -432,7 +434,7 @@ struct PushReportTests {
     @Test func aTapOnTheNotificationOpensItsLinkAndReportsAClick() async {
         let server = FakeKirora()
         let opened = Locked<[URL]>([])
-        let handler = PushTapHandler(transport: server, openURL: { url in opened.withLock { $0.append(url) } })
+        let handler = PushTapHandler(transport: server, apiBase: { testApiBase }, openURL: { url in opened.withLock { $0.append(url) } })
         let payload = KiroraPushPayload(userInfo: [
             "aps": ["alert": "Hi"], "kirora": "true", "trackingUrl": "https://api.test.kirora.io/t/p/abc",
             "actionUrl": "myapp://orders/1",
@@ -445,14 +447,14 @@ struct PushReportTests {
 
     @Test func aTapWithoutALinkIsAnOpen() async {
         let server = FakeKirora()
-        let handler = PushTapHandler(transport: server, openURL: { _ in })
+        let handler = PushTapHandler(transport: server, apiBase: { testApiBase }, openURL: { _ in })
         await handler.handle(KiroraPushPayload(userInfo: ["kirora": "true", "trackingUrl": "https://api.test.kirora.io/t/p/abc"])!, action: .open)
         #expect(server.requests.first?.body == .object(["event": .string("opened")]))
     }
 
     @Test func aPushWithoutTrackingUrlReportsNothing() async {
         let server = FakeKirora()
-        let handler = PushTapHandler(transport: server, openURL: { _ in })
+        let handler = PushTapHandler(transport: server, apiBase: { testApiBase }, openURL: { _ in })
         await handler.handle(KiroraPushPayload(userInfo: ["kirora": "true", "actionUrl": "https://shop.example"])!, action: .open)
         #expect(server.requests.isEmpty)
         #expect(KiroraPushPayload(userInfo: ["aps": ["alert": "Someone else's"]]) == nil)
@@ -484,6 +486,96 @@ struct PushReportTests {
         #expect(refused.requests.count == 1)
     }
 
+    /// Reports go only to a `/t/p/…` address on the configured API, as on Android.
+    @Test func aTapIsReportedOnlyToTheApisTrackingPath() async {
+        let base = URL(string: "https://api.test.kirora.io")!
+        for good in ["https://api.test.kirora.io/t/p/abc", "https://API.test.kirora.io:443/t/p/abc?x=1"] {
+            #expect(trustedTrackingUrl(URL(string: good)!, apiBase: base) != nil, "\(good)")
+            #expect(KiroraNotificationService.trustedTrackingUrl(URL(string: good)!, apiBase: base) != nil, "\(good)")
+        }
+        for bad in [
+            "https://evil.example/t/p/abc", "http://api.test.kirora.io/t/p/abc", "https://api.test.kirora.io:8443/t/p/abc",
+            "https://api.test.kirora.io/client/v1/events/batch", "https://api.test.kirora.io/t/p/../../client/v1/x",
+            "https://user:pass@api.test.kirora.io/t/p/abc", "https://api.test.kirora.io.evil.example/t/p/abc",
+        ] {
+            #expect(trustedTrackingUrl(URL(string: bad)!, apiBase: base) == nil, "\(bad)")
+            #expect(KiroraNotificationService.trustedTrackingUrl(URL(string: bad)!, apiBase: base) == nil, "\(bad)")
+        }
+        // An apiUrl with a path (behind a proxy): the tracking path is under it.
+        let proxied = URL(string: "https://example.com/kirora/")!
+        #expect(trustedTrackingUrl(URL(string: "https://example.com/kirora/t/p/abc")!, apiBase: proxied) != nil)
+        #expect(KiroraNotificationService.trustedTrackingUrl(URL(string: "https://example.com/kirora/t/p/abc")!, apiBase: proxied) != nil)
+        #expect(trustedTrackingUrl(URL(string: "https://example.com/t/p/abc")!, apiBase: proxied) == nil)
+        #expect(KiroraNotificationService.trustedTrackingUrl(URL(string: "https://example.com/t/p/abc")!, apiBase: proxied) == nil)
+        // A local apiUrl, over http, with its port.
+        let local = URL(string: "http://localhost:3000")!
+        #expect(trustedTrackingUrl(URL(string: "http://localhost:3000/t/p/abc")!, apiBase: local) != nil)
+        #expect(trustedTrackingUrl(URL(string: "http://localhost/t/p/abc")!, apiBase: local) == nil)
+
+        let server = FakeKirora()
+        let opened = Locked<[URL]>([])
+        let handler = PushTapHandler(transport: server, apiBase: { base }, openURL: { url in opened.withLock { $0.append(url) } })
+        let payload = KiroraPushPayload(userInfo: [
+            "kirora": "true", "trackingUrl": "https://evil.example/t/p/abc", "actionUrl": "myapp://orders/1",
+        ])!
+        await handler.handle(payload, action: .open)
+        #expect(server.requests.isEmpty)
+        // The tap still opens its link.
+        #expect(opened.current == [URL(string: "myapp://orders/1")!])
+    }
+
+    @Test func aClientsApiUrlIsWhereTapsAreReported() async {
+        let app = TestApp()
+        app.start(apiUrl: "https://api.test.kirora.io/")
+        // A client exists: no wait.
+        #expect(await reportingApiBase(waitingUpTo: 5) == URL(string: "https://api.test.kirora.io"))
+    }
+
+    /// The app's notification delegate decides on a Kirora push in the foreground, but one
+    /// that never answers (it ignores pushes it didn't make) must not drop it.
+    @Test func anAppDelegateThatAnswersDecides() async {
+        let answers = Locked<[String]>([])
+        askWithFallback(
+            timeout: 0.1, answer: { (value: String) in answers.withLock { $0.append(value) } },
+            ask: { answer in answer("app: hide") }, fallback: { answer in answer("sdk: show") }
+        )
+        await settle(0.2)
+        #expect(answers.current == ["app: hide"])
+    }
+
+    @Test func anAppDelegateThatNeverAnswersIsAnsweredFor() async {
+        let answers = Locked<[String]>([])
+        askWithFallback(
+            timeout: 0.1, answer: { (value: String) in answers.withLock { $0.append(value) } },
+            ask: { _ in }, fallback: { answer in answer("sdk: show") }
+        )
+        #expect(answers.current.isEmpty)
+        #expect(await eventually { answers.current == ["sdk: show"] })
+    }
+
+    @Test func aLateAnswerIsIgnoredAndAnEarlyOneStopsTheFallback() async {
+        let answers = Locked<[String]>([])
+        let held = Locked<(@Sendable (String) -> Void)?>(nil)
+        askWithFallback(
+            timeout: 0.1, answer: { (value: String) in answers.withLock { $0.append(value) } },
+            ask: { answer in held.withLock { $0 = answer } }, fallback: { answer in answer("sdk: show") }
+        )
+        #expect(await eventually { answers.current == ["sdk: show"] })
+        held.current?("app: too late")
+        #expect(answers.current == ["sdk: show"])
+
+        let second = Locked<[String]>([])
+        let later = Locked<(@Sendable (String) -> Void)?>(nil)
+        askWithFallback(
+            timeout: 0.2, answer: { (value: String) in second.withLock { $0.append(value) } },
+            ask: { answer in later.withLock { $0 = answer } }, fallback: { answer in answer("sdk: show") }
+        )
+        // Answered asynchronously, within the time.
+        later.current?("app: show")
+        await settle(0.3)
+        #expect(second.current == ["app: show"])
+    }
+
     @Test func eachTapIsHandledOnce() {
         let id = UUID().uuidString
         #expect(firstTimeHandling(id))
@@ -493,6 +585,67 @@ struct PushReportTests {
 
 @Suite("Notification Service Extension", .serialized)
 struct NotificationServiceTests {
+    @Test func aPushsButtonsBecomeACategory() throws {
+        let userInfo: [AnyHashable: Any] = [
+            "kirora": "true",
+            "buttons": #"[{"title":"View order","url":"myapp://orders/1"},{"title":"Track","url":"https://shop.example/t"}]"#,
+        ]
+        #expect(KiroraNotificationService.buttonTitles(userInfo) == ["View order", "Track"])
+        let category = try #require(KiroraNotificationService.buttonCategory(["View order", "Track"]))
+        #expect(category.identifier.hasPrefix(KiroraNotificationService.categoryPrefix))
+        // By position, which the app's SDK maps back to the button's link.
+        #expect(category.actions.map(\.identifier) == ["0", "1"])
+        #expect(category.actions.map(\.title) == ["View order", "Track"])
+        #expect(category.actions.allSatisfy { $0.options.contains(.foreground) })
+        // The same buttons, the same category; others, another.
+        #expect(KiroraNotificationService.buttonCategory(["View order", "Track"])?.identifier == category.identifier)
+        #expect(KiroraNotificationService.buttonCategory(["Track", "View order"])?.identifier != category.identifier)
+        // And the app's SDK reads the tap on the first as that button.
+        let payload = try #require(KiroraPushPayload(userInfo: userInfo))
+        #expect(payload.buttonLink(for: category.actions[0].identifier) == URL(string: "myapp://orders/1"))
+    }
+
+    @Test func theLeastRecentlyUsedCategoriesGoFirst() {
+        let max = KiroraNotificationService.maxCategories
+        let order = (0..<(max + 5)).map { "kirora.buttons.\($0)" }
+        let registered = order.dropLast() + ["kirora.buttons.unknown"]
+        let kept = KiroraNotificationService.categoriesToKeep(order: order, registered: Array(registered))
+        #expect(kept.count == max - 1)
+        // The most recent before the newest, and never one older than the record.
+        #expect(kept.first == "kirora.buttons.\(max + 3)")
+        #expect(!kept.contains("kirora.buttons.unknown"))
+        #expect(!kept.contains("kirora.buttons.0"))
+        #expect(Set(kept) == Set((5..<(max + 4)).map { "kirora.buttons.\($0)" }))
+    }
+
+    /// The extension shows the buttons and the app reads which was tapped, by position: they
+    /// must parse every payload alike.
+    @Test func theAppAndTheExtensionReadButtonsAlike() {
+        let payloads: [Any] = [
+            #"[{"title":"A","url":"myapp://a"},{"title":"B"}]"#,
+            #"[{"url":"x"},{"title":"B"}]"#,
+            #"[{"title":""},{"title":"B"}]"#,
+            #"[{"title":"1"},{"title":"2"},{"title":"3"},{"title":"4"},{"title":"5"}]"#,
+            "not json", "[]", [["title": "A"], ["title": "B"]], [["title": 7]],
+        ]
+        for buttons in payloads {
+            let userInfo: [AnyHashable: Any] = ["kirora": "true", "buttons": buttons]
+            let app = KiroraPushPayload(userInfo: userInfo)?.buttons.map(\.title)
+            #expect(app == KiroraNotificationService.buttonTitles(userInfo), "\(buttons)")
+        }
+    }
+
+    @Test func noButtonsNoCategory() {
+        #expect(KiroraNotificationService.buttonTitles(["kirora": "true"]).isEmpty)
+        #expect(KiroraNotificationService.buttonTitles(["kirora": "true", "buttons": "not json"]).isEmpty)
+        #expect(KiroraNotificationService.buttonTitles(["kirora": "true", "buttons": "[]"]).isEmpty)
+        // One without a title would move the others' positions.
+        #expect(KiroraNotificationService.buttonTitles(["kirora": "true", "buttons": #"[{"url":"x"},{"title":"B"}]"#]).isEmpty)
+        // An array works as well as JSON text.
+        #expect(KiroraNotificationService.buttonTitles(["kirora": "true", "buttons": [["title": "A"]]]) == ["A"])
+        #expect(KiroraNotificationService.buttonCategory([]) == nil)
+    }
+
     @Test func reportsDeliveredOnceAndRetriesOnce() async {
         StubProtocol.reset(statuses: [503, 204])
         await KiroraNotificationService.report(URL(string: "https://api.test.kirora.io/t/p/abc"), session: StubProtocol.session)
