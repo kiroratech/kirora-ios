@@ -114,10 +114,10 @@ or `tokens.fail(requestId, message:)`.
   (`KiroraNotificationService`), which the wrapper doesn't create: its README says so.
 - **Callbacks.** `handleDeepLink` and foreground display wait 1.5 seconds at most for the
   app's answer, then act as if there were no callback: the link is opened, the push shown.
-  An app's own native `handleDeepLink`, or notification delegate implementing `willPresent`,
-  decides first; a delegate that leaves a Kirora push unanswered for 1.5 seconds (as plugins
-  such as `flutter_local_notifications` do with pushes they didn't schedule) has the SDK
-  decide instead, so the wrapper's foreground handler is then asked.
+  An app's own native `handleDeepLink` decides first. A Kirora push's foreground display is
+  decided by the SDK before the app's notification delegate is asked, so plugins answering
+  `willPresent` for pushes they didn't make (`firebase_messaging`, `flutter_local_notifications`)
+  can't hide it: the wrapper's foreground handler is the app's only say.
 - **Teardown.** When the wrapper's language goes away but the app doesn't (a Flutter
   engine torn down, a React Native bridge invalidated), call `KiroraWrapper.wrapperDetached()`,
   not `setDeepLinkHandler(nil)`: taps are held again and a tap's link waits for the next

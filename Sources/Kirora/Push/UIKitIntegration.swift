@@ -356,8 +356,8 @@ enum AppDelegateProxy {
     }
 }
 
-/// How long the app's notification delegate has to answer for a Kirora push before the SDK
-/// answers for it, as for the app's other callbacks.
+/// How long the app's notification delegate has to call a Kirora tap's completion handler
+/// before the SDK calls it, as for the app's other callbacks.
 let appDelegateAnswerTimeout: Double = wrapperCallbackTimeout
 
 /// The notification center's delegate: the SDK's, passing every call on to the app's own.
@@ -390,34 +390,20 @@ final class NotificationCenterProxy: NSObject, UNUserNotificationCenterDelegate,
         center.delegate = self
     }
 
-    /// The app's delegate decides whether a push shows in the foreground, Kirora's included.
-    /// But implementing `willPresent` doesn't mean it answers: a delegate may leave pushes it
-    /// didn't make unanswered (`flutter_local_notifications` does), which iOS takes as "don't
-    /// show". So for a Kirora push, the SDK shows it as it would with no delegate if the app's
-    /// hasn't answered within 1.5 seconds. Anyone else's push is the app's alone.
+    /// The SDK decides whether a Kirora push shows in the foreground, before the app's delegate
+    /// is asked (an app decides through the wrapper's foreground handler). A delegate can't be
+    /// trusted to: in Flutter, `FlutterAppDelegate` asks every plugin, and the first to answer,
+    /// often with `[]` for a push it didn't make (`firebase_messaging` does), decides for all.
+    /// Anyone else's push is the app's alone.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping @Sendable (UNNotificationPresentationOptions) -> Void
     ) {
-        let userInfo = notification.request.content.userInfo
+        if Kirora.userNotificationCenter(center, willPresent: notification, withCompletionHandler: completionHandler) { return }
         let selector = #selector(UNUserNotificationCenterDelegate.userNotificationCenter(_:willPresent:withCompletionHandler:))
-        guard let appDelegate, appDelegate.responds(to: selector) else {
-            return Kirora.presentInForeground(userInfo, completionHandler)
-        }
-        guard isKiroraPush(userInfo) else {
-            appDelegate.userNotificationCenter?(center, willPresent: notification, withCompletionHandler: completionHandler)
-            return
-        }
-        let data = UncheckedSendable(userInfo)
-        askWithFallback(
-            timeout: appDelegateAnswerTimeout,
-            answer: completionHandler,
-            ask: { answer in
-                appDelegate.userNotificationCenter?(center, willPresent: notification, withCompletionHandler: answer)
-            },
-            fallback: { answer in Kirora.presentInForeground(data.value, answer) }
-        )
+        guard let appDelegate, appDelegate.responds(to: selector) else { return completionHandler([]) }
+        appDelegate.userNotificationCenter?(center, willPresent: notification, withCompletionHandler: completionHandler)
     }
 
     /// Kirora's taps are handled by the SDK first, then passed on. A delegate that leaves a

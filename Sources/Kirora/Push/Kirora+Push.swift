@@ -38,8 +38,9 @@ extension Kirora {
     }
 
     /// Call from your `UNUserNotificationCenterDelegate`'s method of the same name to show
-    /// Kirora pushes while the app is open. Returns false, without calling
-    /// `completionHandler`, for anyone else's push.
+    /// Kirora pushes while the app is open, unless a wrapper's app says not to (asked for 1.5
+    /// seconds at most). Returns false, without calling `completionHandler`, for anyone
+    /// else's push.
     @discardableResult
     public static func userNotificationCenter(
         _ center: UNUserNotificationCenter,
@@ -47,25 +48,18 @@ extension Kirora {
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) -> Bool {
         let userInfo = notification.request.content.userInfo
-        guard foregroundPresentation(for: userInfo) != nil else { return false }
-        presentInForeground(userInfo, completionHandler)
-        return true
-    }
-
-    /// Shows a Kirora push in the foreground, unless a wrapper's app says not to (asked for
-    /// 1.5 seconds at most). Not for anyone else's push.
-    static func presentInForeground(
-        _ userInfo: [AnyHashable: Any],
-        _ completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-    ) {
-        guard let options = foregroundPresentation(for: userInfo) else { return completionHandler([]) }
-        guard wrapperCallbacks.current.foreground != nil else { return completionHandler(options) }
+        guard let options = foregroundPresentation(for: userInfo) else { return false }
+        guard wrapperCallbacks.current.foreground != nil else {
+            completionHandler(options)
+            return true
+        }
         let data = UncheckedSendable(wrapperData(userInfo))
         let completion = UncheckedSendable(completionHandler)
         Task {
             let show = await wrapperShowsInForeground(data.value)
             completion.value(show ? options : [])
         }
+        return true
     }
 
     /// Kirora pushes show while the app is open, as they would outside it; anyone else's

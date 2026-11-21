@@ -21,9 +21,6 @@ enum TrackingReport {
     }
 }
 
-/// Whether a push is Kirora's: it carries the `kirora` marker.
-func isKiroraPush(_ userInfo: [AnyHashable: Any]) -> Bool { userInfo["kirora"] != nil }
-
 /// A Kirora push's own keys, beside `aps`, whether it came through APNs or Firebase.
 ///
 /// A push is Kirora's only if it carries the `kirora` marker. `trackingUrl`, `actionUrl` and
@@ -45,7 +42,7 @@ struct KiroraPushPayload: Equatable, Sendable {
     }
 
     init?(userInfo: [AnyHashable: Any]) {
-        guard isKiroraPush(userInfo) else { return nil }
+        guard userInfo["kirora"] != nil else { return nil }
         // Checked against the API's address when it's reported (`trustedTrackingUrl`).
         trackingUrl = (userInfo["trackingUrl"] as? String).flatMap(URL.init(string:))
         actionUrl = safeLink(userInfo["actionUrl"] as? String)

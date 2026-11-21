@@ -4,11 +4,12 @@
 
 - `trackingConsent`: whether tracking is allowed now, as `getState().trackingConsent`,
   without reading the event queue.
-- Fix: foreground Kirora pushes were dropped when the app's notification delegate (or a
-  library in its chain, such as `flutter_local_notifications`) implements `willPresent` but
-  ignores notifications it didn't schedule. The app's delegate still decides first; if it
-  hasn't answered within 1.5 seconds, the SDK shows the push. A Kirora tap a delegate leaves
-  unanswered has its completion handler called likewise.
+- Fix: foreground Kirora pushes were dropped when the app's notification delegate, or a
+  library in its chain (`flutter_local_notifications`, `firebase_messaging`), ignored them
+  or answered `[]` for pushes it didn't make. The SDK now answers `willPresent` for Kirora's
+  pushes before the app's delegate, which no longer decides on them; wrapper apps decide
+  through the wrapper's foreground handler. A Kirora tap a delegate leaves unanswered has
+  its completion handler called after 1.5 seconds.
 - Push buttons show: the Notification Service Extension makes a category from the push's
   `buttons` and adds it to the app's own. Without the extension, still none.
 - `Kirora.addNotificationClickListener(_:)`: hears taps on Kirora pushes and their buttons,

@@ -531,26 +531,28 @@ struct PushReportTests {
         #expect(await reportingApiBase(waitingUpTo: 5) == URL(string: "https://api.test.kirora.io"))
     }
 
-    /// The app's notification delegate decides on a Kirora push in the foreground, but one
-    /// that never answers (it ignores pushes it didn't make) must not drop it.
+    /// A Kirora tap is passed to the app's notification delegate after the SDK handles it;
+    /// one that never calls the completion handler (it ignores pushes it didn't make) is
+    /// answered for. (Foreground display isn't asked of it: the SDK decides on Kirora's
+    /// pushes first, in `NotificationCenterProxy`, which needs UIKit to test.)
     @Test func anAppDelegateThatAnswersDecides() async {
         let answers = Locked<[String]>([])
         askWithFallback(
             timeout: 0.1, answer: { (value: String) in answers.withLock { $0.append(value) } },
-            ask: { answer in answer("app: hide") }, fallback: { answer in answer("sdk: show") }
+            ask: { answer in answer("app") }, fallback: { answer in answer("sdk") }
         )
         await settle(0.2)
-        #expect(answers.current == ["app: hide"])
+        #expect(answers.current == ["app"])
     }
 
     @Test func anAppDelegateThatNeverAnswersIsAnsweredFor() async {
         let answers = Locked<[String]>([])
         askWithFallback(
             timeout: 0.1, answer: { (value: String) in answers.withLock { $0.append(value) } },
-            ask: { _ in }, fallback: { answer in answer("sdk: show") }
+            ask: { _ in }, fallback: { answer in answer("sdk") }
         )
         #expect(answers.current.isEmpty)
-        #expect(await eventually { answers.current == ["sdk: show"] })
+        #expect(await eventually { answers.current == ["sdk"] })
     }
 
     @Test func aLateAnswerIsIgnoredAndAnEarlyOneStopsTheFallback() async {
@@ -558,22 +560,22 @@ struct PushReportTests {
         let held = Locked<(@Sendable (String) -> Void)?>(nil)
         askWithFallback(
             timeout: 0.1, answer: { (value: String) in answers.withLock { $0.append(value) } },
-            ask: { answer in held.withLock { $0 = answer } }, fallback: { answer in answer("sdk: show") }
+            ask: { answer in held.withLock { $0 = answer } }, fallback: { answer in answer("sdk") }
         )
-        #expect(await eventually { answers.current == ["sdk: show"] })
-        held.current?("app: too late")
-        #expect(answers.current == ["sdk: show"])
+        #expect(await eventually { answers.current == ["sdk"] })
+        held.current?("app, late")
+        #expect(answers.current == ["sdk"])
 
         let second = Locked<[String]>([])
         let later = Locked<(@Sendable (String) -> Void)?>(nil)
         askWithFallback(
             timeout: 0.2, answer: { (value: String) in second.withLock { $0.append(value) } },
-            ask: { answer in later.withLock { $0 = answer } }, fallback: { answer in answer("sdk: show") }
+            ask: { answer in later.withLock { $0 = answer } }, fallback: { answer in answer("sdk") }
         )
         // Answered asynchronously, within the time.
-        later.current?("app: show")
+        later.current?("app")
         await settle(0.3)
-        #expect(second.current == ["app: show"])
+        #expect(second.current == ["app"])
     }
 
     @Test func eachTapIsHandledOnce() {
