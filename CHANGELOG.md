@@ -10,6 +10,10 @@
   pushes before the app's delegate, which no longer decides on them; wrapper apps decide
   through the wrapper's foreground handler. A Kirora tap a delegate leaves unanswered has
   its completion handler called after 1.5 seconds.
+- Fix: a notification delegate that keeps the one it found and passes calls on to it
+  (`firebase_messaging` does), set after the SDK's, no longer loops with it until the app
+  crashes on a tap or another library's push in the foreground. Calls it passes back go on
+  to the delegate before it.
 - Push buttons show: the Notification Service Extension makes a category from the push's
   `buttons` and adds it to the app's own. Without the extension, still none.
 - `Kirora.addNotificationClickListener(_:)`: hears taps on Kirora pushes and their buttons,

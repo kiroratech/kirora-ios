@@ -363,13 +363,11 @@ let appDelegateAnswerTimeout: Double = wrapperCallbackTimeout
 /// The notification center's delegate: the SDK's, passing every call on to the app's own.
 /// When the app (or another SDK) sets a delegate later, that one becomes the one passed to,
 /// and this stays installed.
-// Its state is only touched on the main thread, where iOS calls a notification center's
-// delegate and the SDK installs it.
 final class NotificationCenterProxy: NSObject, UNUserNotificationCenterDelegate, @unchecked Sendable {
     static let shared = NotificationCenterProxy()
 
-    /// The app's delegate. Weak, as the notification center's own is.
-    weak var appDelegate: UNUserNotificationCenterDelegate?
+    /// The app's delegates, weakly, as the notification center holds its own.
+    let delegates = DelegateChain()
 
     private typealias Setter = @convention(c) (AnyObject, Selector, AnyObject?) -> Void
     private typealias SetterBlock = @convention(block) (AnyObject, AnyObject?) -> Void
@@ -382,12 +380,21 @@ final class NotificationCenterProxy: NSObject, UNUserNotificationCenterDelegate,
         let original = unsafeBitCast(method_getImplementation(method), to: Setter.self)
         let block: SetterBlock = { receiver, newDelegate in
             let proxy = NotificationCenterProxy.shared
-            if newDelegate !== proxy { proxy.appDelegate = newDelegate as? UNUserNotificationCenterDelegate }
+            if newDelegate !== proxy { proxy.delegates.set(newDelegate) }
             original(receiver, selector, proxy)
         }
-        if let existing = center.delegate, existing !== self { appDelegate = existing }
+        if let existing = center.delegate, existing !== self { delegates.set(existing) }
         class_replaceMethod(centerClass, selector, imp_implementationWithBlock(block), method_getTypeEncoding(method))
         center.delegate = self
+    }
+
+    /// Passes a call to the app's delegate that implements `selector` (see ``DelegateChain``).
+    private func passOn(_ selector: Selector, _ call: (UNUserNotificationCenterDelegate) -> Void) -> Bool {
+        delegates.passOn(where: { Self.implements($0, selector) }) { call($0 as! UNUserNotificationCenterDelegate) }
+    }
+
+    private static func implements(_ delegate: AnyObject, _ selector: Selector) -> Bool {
+        (delegate as? UNUserNotificationCenterDelegate)?.responds(to: selector) == true
     }
 
     /// The SDK decides whether a Kirora push shows in the foreground, before the app's delegate
@@ -402,8 +409,10 @@ final class NotificationCenterProxy: NSObject, UNUserNotificationCenterDelegate,
     ) {
         if Kirora.userNotificationCenter(center, willPresent: notification, withCompletionHandler: completionHandler) { return }
         let selector = #selector(UNUserNotificationCenterDelegate.userNotificationCenter(_:willPresent:withCompletionHandler:))
-        guard let appDelegate, appDelegate.responds(to: selector) else { return completionHandler([]) }
-        appDelegate.userNotificationCenter?(center, willPresent: notification, withCompletionHandler: completionHandler)
+        let passed = passOn(selector) { $0.userNotificationCenter?(center, willPresent: notification, withCompletionHandler: completionHandler) }
+        // Passed back with no delegate left: the one that passed it back still has the call, and
+        // in Flutter, other plugins may answer after it. Only with no delegate at all, iOS's default.
+        if !passed, !delegates.isPassingOn { completionHandler([]) }
     }
 
     /// Kirora's taps are handled by the SDK first, then passed on. A delegate that leaves a
@@ -415,16 +424,18 @@ final class NotificationCenterProxy: NSObject, UNUserNotificationCenterDelegate,
     ) {
         let isKiroras = Kirora.handleTap(response)
         let selector = #selector(UNUserNotificationCenterDelegate.userNotificationCenter(_:didReceive:withCompletionHandler:))
-        guard let appDelegate, appDelegate.responds(to: selector) else { return completionHandler() }
+        let passOn: (@escaping @Sendable () -> Void) -> Bool = { done in
+            self.passOn(selector) { $0.userNotificationCenter?(center, didReceive: response, withCompletionHandler: done) }
+        }
         guard isKiroras else {
-            appDelegate.userNotificationCenter?(center, didReceive: response, withCompletionHandler: completionHandler)
+            if !passOn(completionHandler) { completionHandler() }
             return
         }
         askWithFallback(
             timeout: appDelegateAnswerTimeout,
             answer: { (_: Void) in completionHandler() },
             ask: { answer in
-                appDelegate.userNotificationCenter?(center, didReceive: response, withCompletionHandler: { answer(()) })
+                if !passOn({ answer(()) }) { answer(()) }
             },
             fallback: { answer in answer(()) }
         )
@@ -432,13 +443,14 @@ final class NotificationCenterProxy: NSObject, UNUserNotificationCenterDelegate,
 
     @available(iOS 12.0, *)
     func userNotificationCenter(_ center: UNUserNotificationCenter, openSettingsFor notification: UNNotification?) {
-        appDelegate?.userNotificationCenter?(center, openSettingsFor: notification)
+        let selector = #selector(UNUserNotificationCenterDelegate.userNotificationCenter(_:openSettingsFor:))
+        _ = passOn(selector) { $0.userNotificationCenter?(center, openSettingsFor: notification) }
     }
 
     override func responds(to selector: Selector!) -> Bool {
         // Only claim "open settings" if the app handles it: iOS shows a button for it then.
         if selector == #selector(UNUserNotificationCenterDelegate.userNotificationCenter(_:openSettingsFor:)) {
-            return appDelegate?.responds(to: selector) ?? false
+            return delegates.contains { Self.implements($0, selector) }
         }
         return super.responds(to: selector)
     }
