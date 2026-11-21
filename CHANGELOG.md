@@ -14,6 +14,11 @@
   (`firebase_messaging` does), set after the SDK's, no longer loops with it until the app
   crashes on a tap or another library's push in the foreground. Calls it passes back go on
   to the delegate before it.
+- Fix: a push's web link was swallowed in Flutter and React Native apps, whose app delegates
+  say they handled any web link. A link nobody claims now opens with iOS (the browser, or
+  the app that owns it); only hosts the app lists in `KiroraUniversalLinkHosts` go to its
+  app delegate as universal links. A native app that kept its universal links in the app
+  through its delegate lists their hosts, or claims them in `handleDeepLink`.
 - Push buttons show: the Notification Service Extension makes a category from the push's
   `buttons` and adds it to the app's own. Without the extension, still none.
 - `Kirora.addNotificationClickListener(_:)`: hears taps on Kirora pushes and their buttons,

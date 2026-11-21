@@ -456,20 +456,19 @@ final class NotificationCenterProxy: NSObject, UNUserNotificationCenterDelegate,
     }
 }
 
-/// Opens a push's link: first the app's `handleDeepLink`, if it opens the link itself. A web
-/// link then goes to the app as a universal link: to the scene delegate in a scene-based
-/// app (SwiftUI's included), or the app delegate. Anything else, including an app link
-/// (`myapp://…`), goes to `UIApplication.open`.
+/// Opens a push's link: first the app's `handleDeepLink`, if it opens the link itself. One of
+/// the app's own universal links (a host it lists in `KiroraUniversalLinkHosts`) then goes to
+/// the app delegate, as iOS hands it one. Anything else, or one the delegate doesn't take,
+/// opens with `UIApplication.open`: the browser, or the app that owns the link.
 @MainActor
 func openPushLink(_ url: URL, handleDeepLink: (@MainActor @Sendable (URL) -> Bool)?) {
     if handleDeepLink?(url) == true { return }
     let application = UIApplication.shared
-    // A web link the app delegate says it handled (a universal link of its own) stays in
-    // the app. A scene delegate is never handed one: its `scene(_:continue:)` can't say
-    // whether it did, so an external link it ignores would open nothing. A scene-based app
-    // claims its own universal links in `handleDeepLink`; anything unclaimed opens with iOS,
-    // in the browser or the app that owns it.
-    if let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+    // Only for listed hosts: Flutter's and React Native's app delegates say they handled any
+    // web link, which would swallow every other one. A scene delegate is never handed one:
+    // its `scene(_:continue:)` can't say whether it did, so a scene-based app claims its own
+    // universal links in `handleDeepLink`.
+    if isOwnUniversalLink(url, hosts: universalLinkHosts) {
         let activity = NSUserActivity(activityType: NSUserActivityTypeBrowsingWeb)
         activity.webpageURL = url
         if application.delegate?.application?(application, continue: activity, restorationHandler: { _ in }) == true {

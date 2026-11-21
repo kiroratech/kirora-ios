@@ -125,6 +125,11 @@ or `tokens.fail(requestId, message:)`.
 - **Launch links.** After `installPushIntegration()`, a tap's link heard before the first
   `setDeepLinkHandler` call waits for it (10 seconds at most), then goes the usual way. The
   tap listener hears that tap after its link has gone.
+- **Web links.** A tap's link that neither the app's handler nor the wrapper's claims opens
+  with iOS, in the browser or the app that owns it. The app's delegate isn't asked (Flutter's
+  and React Native's claim any web link) unless the app lists the link's host in
+  `KiroraUniversalLinkHosts` in its Info.plist. Route the app's own universal links in the
+  wrapper's deep-link handler.
 - **Methods.** Every method and option in the public interface is there to forward; nothing
   is reimplemented.
 
