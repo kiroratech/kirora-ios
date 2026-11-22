@@ -10,8 +10,9 @@ public struct KiroraOptions: Sendable {
 
     /// Asks your server for a signed user token. Called by ``Kirora/identify(_:)`` without a
     /// token, and again when Kirora refuses an expired one. Throw if it fails: queued
-    /// events are kept. One that hasn't answered after 30 seconds counts as failed.
-    public var fetchUserToken: (@Sendable () async throws -> String)?
+    /// events are kept. No token (`nil` or empty), or none after 30 seconds, counts as a
+    /// failure too.
+    public var fetchUserToken: (@Sendable () async throws -> String?)?
 
     /// Called on the main thread when the user's token fails in the background, where
     /// nothing else would tell your app: sending events, or registering for push. Once per
@@ -22,8 +23,8 @@ public struct KiroraOptions: Sendable {
     public var onAuthenticationFailed: (@MainActor @Sendable (AuthenticationFailureReason) -> Void)?
 
     /// Registers this device for push notifications. Off (`nil`) by default; pass
-    /// ``PushOptions/enabled`` for the defaults.
-    public var push: PushOptions?
+    /// ``KiroraPushOptions/enabled`` for the defaults.
+    public var push: KiroraPushOptions?
 
     /// Track and store nothing until ``Kirora/setTrackingConsent(_:)`` is called with
     /// `true`, e.g. for users in the EU or UK.
@@ -61,9 +62,9 @@ public struct KiroraOptions: Sendable {
 
     public init(
         clientKey: String,
-        fetchUserToken: (@Sendable () async throws -> String)? = nil,
+        fetchUserToken: (@Sendable () async throws -> String?)? = nil,
         onAuthenticationFailed: (@MainActor @Sendable (AuthenticationFailureReason) -> Void)? = nil,
-        push: PushOptions? = nil,
+        push: KiroraPushOptions? = nil,
         requireTrackingConsent: Bool = false,
         trackSessions: Bool = true,
         trackAppLifecycle: Bool = false,
@@ -97,7 +98,7 @@ public enum AuthenticationFailureReason: String, Sendable, Equatable {
 
 /// Push settings. Everything else about push (the APNs credential, the push app) comes
 /// from Kirora, not the app.
-public struct PushOptions: Sendable, Equatable {
+public struct KiroraPushOptions: Sendable, Equatable {
     /// Only needed if the workspace has more than one iOS push app: the one to register
     /// with. Kirora chooses otherwise.
     public var pushAppId: String?
@@ -107,7 +108,7 @@ public struct PushOptions: Sendable, Equatable {
     }
 
     /// Push on, with Kirora choosing the push app.
-    public static let enabled = PushOptions()
+    public static let enabled = KiroraPushOptions()
 }
 
 /// The answer to ``Kirora/requestPushPermission()``. The same values in every Kirora SDK.

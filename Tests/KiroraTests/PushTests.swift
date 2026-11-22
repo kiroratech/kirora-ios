@@ -46,7 +46,7 @@ struct PushRegistrationTests {
 
     @Test func namesThePushAppTheAppChose() async throws {
         let app = TestApp()
-        let kirora = app.start(push: PushOptions(pushAppId: "9b2e0a2c-0000-4000-8000-000000000001"))
+        let kirora = app.start(push: KiroraPushOptions(pushAppId: "9b2e0a2c-0000-4000-8000-000000000001"))
         try await kirora.identify(userToken("user-1"))
         #expect(app.server.requests("GET", "/client/v1/push-app").first?.query["pushAppId"] == "9b2e0a2c-0000-4000-8000-000000000001")
     }

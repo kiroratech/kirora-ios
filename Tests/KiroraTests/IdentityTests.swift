@@ -50,6 +50,18 @@ struct IdentityTests {
         await #expect(throws: UserTokenError.self) { try await kirora.identify() }
     }
 
+    /// No token (nil or empty) is a failed fetch: nothing is sent with an empty token.
+    @Test(arguments: [nil, ""] as [String?])
+    func fetchUserTokenWithNoTokenThrowsUserTokenError(token: String?) async throws {
+        let app = TestApp()
+        let kirora = app.start(fetchUserToken: { token }, trackSessions: false)
+        kirora.track("Viewed")
+        let error = await #expect(throws: UserTokenError.self) { try await kirora.identify() }
+        #expect(error?.message == "fetchUserToken returned no token")
+        await kirora.flush()
+        #expect(app.server.batches.allSatisfy { $0.token != "" })
+    }
+
     @Test func aHungFetchUserTokenTimesOut() async {
         let app = TestApp()
         let kirora = app.start(

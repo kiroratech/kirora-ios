@@ -160,13 +160,15 @@ struct DeliveryTests {
         #expect(kirora.getState().queuedEventCount == 0)
     }
 
-    @Test func anInvalidBatchIsSplitToFindTheBadEvent() async throws {
+    /// A 400 or 422 naming an event: halving the batch finds it.
+    @Test(arguments: [400, 422])
+    func anInvalidBatchIsSplitToFindTheBadEvent(status: Int) async throws {
         let app = TestApp()
         let kirora = app.start(trackSessions: false)
         app.server.answer { request in
             guard request.path.hasSuffix("/events/batch") else { return nil }
             guard let bad = request.eventNames.firstIndex(of: "Bad") else { return nil }
-            return .validationError(fields: ["events.\(bad).name"])
+            return .validationError(fields: ["events.\(bad).name"], status: status)
         }
         for name in ["A", "B", "Bad", "C"] { kirora.track(name) }
         try await kirora.identify(userToken("user-1"))
@@ -190,6 +192,10 @@ struct DeliveryTests {
             // Kirora's, but no event at fault.
             .error(400, "BAD_REQUEST"),
             .error(400, "VALIDATION_ERROR"),
+            // A 422 naming no event (a proxy answering 422 to everything) is the same.
+            FakeAnswer(status: 422, body: nil),
+            .error(422, "VALIDATION_ERROR"),
+            .validationError(fields: ["kirora-sdk"], in: "headers", status: 422),
         ]
         for refusal in refusals {
             let app = TestApp()

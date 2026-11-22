@@ -174,7 +174,7 @@ With `fetchUserToken`, the SDK asks for a fresh token 60 seconds before the curr
 
 A `401` that no fresh token resolves keeps the events. With `fetchUserToken`, sending backs off (to about five minutes) instead of asking for a token on every attempt; without it, nothing is sent as that token again. Either way, the next `identify()` sends them.
 
-When the token fails in the background (sending events, registering for push), `onAuthenticationFailed` is called on the main thread with `.fetchFailed` (`fetchUserToken` threw or timed out) or `.refused` (Kirora answered `401` and no fresh token was accepted: refused too, or none to try, without `fetchUserToken`). It's called once per failure, not per retry: again only after a request succeeds or another `identify()`. It isn't called for a failure `identify()` or `setPushConsent(_:)` throws, or while the user is signing out. Sign the user out, or ask them to sign in again:
+When the token fails in the background (sending events, registering for push), `onAuthenticationFailed` is called on the main thread with `.fetchFailed` (`fetchUserToken` threw, returned no token, or timed out) or `.refused` (Kirora answered `401` and no fresh token was accepted: refused too, or none to try, without `fetchUserToken`). It's called once per failure, not per retry: again only after a request succeeds or another `identify()`. It isn't called for a failure `identify()` or `setPushConsent(_:)` throws, or while the user is signing out. Sign the user out, or ask them to sign in again:
 
 ```swift
 onAuthenticationFailed: { reason in
@@ -235,7 +235,7 @@ With `trackAppLifecycle: true`, the SDK also records `Application Installed`, `A
 ### Delivery and storage
 
 - Delivery starts at 20 queued events, otherwise after about 30 seconds, and is attempted on backgrounding and connectivity recovery.
-- Batches hold at most 100 events and target 200,000 encoded bytes. A batch that is too large (`413`) or invalid (`422`, or a `400` whose `errors` name a field under `events`) is split to isolate the event at fault, which alone is dropped. A `400` naming only other fields (a refused header), or none (a proxy's page), is kept and retried.
+- Batches hold at most 100 events and target 200,000 encoded bytes. A batch that is too large (`413`), or invalid for a reason an event names (a `400` or `422` whose `errors` name a body field under `events`), is split to isolate the event at fault, which alone is dropped. A `400` or `422` naming only other fields (a refused header), or none (a proxy's page, a wrong `apiUrl`), is kept and retried.
 - A refusal of the whole request that no event caused (a redirect, `403`, `404`, `409`, or a `400` naming a header), as a wrong `apiUrl`, a proxy or a captive portal answers, keeps the events and backs off like a network failure. `403 PLAN_FEATURE_UNAVAILABLE` drops the batch: the plan doesn't take those events.
 - The disk queue holds at most 1,000 events and 1,000,000 encoded bytes, including ownership metadata. Oldest records are dropped when either budget is exceeded.
 - Network failures and retryable responses back off exponentially to about five minutes, with jitter. `Retry-After` is honoured; unusually large values are capped at one week.
@@ -266,7 +266,7 @@ The tracking choice is persisted per workspace. Refusals are stored independentl
 
 1. Add **Push Notifications** to your app target's capabilities and use a matching provisioning profile.
 2. Configure an iOS push app and its credentials in Kirora. For APNs, provide the `.p8` key, key ID, team ID and bundle ID.
-3. Add `push: .enabled` to the retained client's options. Use `PushOptions(pushAppId: "…")` if you need to select a particular iOS push app.
+3. Add `push: .enabled` to the retained client's options. Use `KiroraPushOptions(pushAppId: "…")` if you need to select a particular iOS push app.
 4. Identify the signed-in user, then request permission at a suitable point in your app:
 
 ```swift
@@ -379,8 +379,8 @@ Without the extension, iOS delivered reports, Kirora image attachments and butto
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `clientKey` | Required | Workspace's public SDK key |
-| `fetchUserToken` | `nil` | `@Sendable () async throws -> String`; fetches a token from your server, with a 30-second SDK timeout |
-| `push` | `nil` | `.enabled` or `PushOptions(pushAppId:)` |
+| `fetchUserToken` | `nil` | `@Sendable () async throws -> String?`; fetches a token from your server, with a 30-second SDK timeout. Throw, or return `nil`, when there's none: `identify()` then throws `UserTokenError` |
+| `push` | `nil` | `.enabled` or `KiroraPushOptions(pushAppId:)` |
 | `requireTrackingConsent` | `false` | Require a tracking grant before behavioural collection |
 | `trackSessions` | `true` | Session events and `context.sessionId` |
 | `trackAppLifecycle` | `false` | Automatic application lifecycle events |

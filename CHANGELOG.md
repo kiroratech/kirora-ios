@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `PushOptions` is now `KiroraPushOptions`, the name every Kirora SDK uses.
+- `fetchUserToken` may return no token: it's `async throws -> String?`. `nil` or empty is a
+  failed fetch, as a throw is: `identify()` throws `UserTokenError` ("fetchUserToken
+  returned no token"), a background refresh tells `onAuthenticationFailed` `.fetchFailed`
+  once the token has expired, and nothing is sent with an empty token. A wrapper's
+  `TokenRequests.answer(_:token:)` takes `nil` the same way.
+- A `422` is split per event only when its `errors` name a body field under `events`, as a
+  `400` is. One naming no event (a proxy answering `422` to everything, a wrong `apiUrl`)
+  keeps the events and backs off, instead of dropping the queue one event at a time.
 - `trackingConsent`: whether tracking is allowed now, as `getState().trackingConsent`,
   without reading the event queue.
 - Fix: foreground Kirora pushes were dropped when the app's notification delegate, or a

@@ -22,11 +22,16 @@ public class KiroraError: Error, LocalizedError, CustomStringConvertible, @unche
     public var errorDescription: String? { description }
 }
 
-/// The app's `fetchUserToken` failed or didn't answer within 30 seconds. Queued events
-/// are kept and retried later. ``KiroraError/underlying`` is what it threw, or the timeout.
+/// The app's `fetchUserToken` failed, returned no token, or didn't answer within 30
+/// seconds. Queued events are kept and retried later. ``KiroraError/underlying`` is what
+/// it threw, or the timeout.
 public final class UserTokenError: KiroraError, @unchecked Sendable {
     init(_ underlying: Error) {
         super.init("fetchUserToken failed: \(underlying)", underlying: underlying)
+    }
+
+    init(message: String) {
+        super.init(message)
     }
 }
 

@@ -158,7 +158,7 @@ final class PushRegistrar: @unchecked Sendable {
     private let api: ClientAPI
     private let identity: Identity
     private let store: KeyValueStore
-    private let options: PushOptions?
+    private let options: KiroraPushOptions?
     private let deviceId: DeviceId
     private let deviceInfo: DeviceInfo
     private let platform: PushPlatform
@@ -182,7 +182,7 @@ final class PushRegistrar: @unchecked Sendable {
     private let failedFor = Locked<SignedInUser?>(nil)
 
     init(
-        api: ClientAPI, identity: Identity, store: KeyValueStore, options: PushOptions?,
+        api: ClientAPI, identity: Identity, store: KeyValueStore, options: KiroraPushOptions?,
         deviceId: DeviceId, deviceInfo: DeviceInfo, platform: PushPlatform, tokens: PushTokens,
         log: Log, timing: DeliveryTiming, now: @escaping @Sendable () -> Date,
         onDetached: @escaping @Sendable () -> Void = {}

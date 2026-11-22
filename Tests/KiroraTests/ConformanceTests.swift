@@ -1427,7 +1427,7 @@ struct EventContextTests {
 struct AuthenticationFailedTests {
     /// Starts a client whose failures land in `reasons`.
     private func start(
-        _ app: TestApp, fetch: (@Sendable () async throws -> String)?, push: PushOptions? = nil,
+        _ app: TestApp, fetch: (@Sendable () async throws -> String?)?, push: KiroraPushOptions? = nil,
         reasons: Locked<[AuthenticationFailureReason]>
     ) -> Kirora {
         app.start(
@@ -1449,6 +1449,19 @@ struct AuthenticationFailedTests {
         await settle(0.5)
         #expect(app.server.batches.count > 1)
         #expect(reasons.current == [.fetchFailed])
+    }
+
+    @Test func noTokenFromFetchUserTokenWhileSendingIsFetchFailed() async throws {
+        let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let kirora = start(app, fetch: { nil }, reasons: reasons)
+        try await kirora.identify(userToken("u"))
+        app.server.answer { $0.path == "/client/v1/events/batch" ? .error(401, "UNAUTHORIZED") : nil }
+        kirora.track("Viewed")
+        await kirora.flush()
+        #expect(await eventually { !reasons.current.isEmpty })
+        #expect(reasons.current == [.fetchFailed])
+        #expect(app.server.batches.allSatisfy { $0.token != "" })
     }
 
     @Test func aFreshTokenKiroraRefusesWhileSendingIsRefused() async throws {

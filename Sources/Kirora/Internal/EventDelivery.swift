@@ -247,13 +247,14 @@ actor EventDelivery {
     }
 
     /// Too large, or invalid for a reason an event names: halving the batch finds it, and
-    /// drops only it. A 400 whose `errors` name no body field under `events` (a refused
-    /// `Kirora-SDK` header), or that has no `errors` (a proxy's page), is a problem with the
-    /// request, which each event alone would meet just the same: not split, kept.
+    /// drops only it. A 400 or 422 whose `errors` name no body field under `events` (a
+    /// refused `Kirora-SDK` header), or that has no `errors` (a proxy's page, a wrong
+    /// `apiUrl`), is a problem with the request, which each event alone would meet just the
+    /// same: not split, kept.
     private func blamesEvents(_ error: KiroraApiError) -> Bool {
         switch error.status {
-        case 413, 422: return true
-        case 400:
+        case 413: return true
+        case 400, 422:
             return error.fields.contains { part, field in
                 (part == nil || part == "body") && (field == "events" || field.hasPrefix("events."))
             }

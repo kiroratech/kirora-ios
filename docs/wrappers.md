@@ -95,7 +95,8 @@ KiroraWrapper.setTapListener { tap in emit("kirora.pushTapped", tap) }
 ```
 
 From the wrapper's language, answer a token request with `tokens.answer(requestId, token:)`
-or `tokens.fail(requestId, message:)`.
+or `tokens.fail(requestId, message:)`. A `nil` or empty token (the app's `fetchUserToken`
+gave none) is a failed fetch, as `fail` is.
 
 ## What the SDK guarantees
 

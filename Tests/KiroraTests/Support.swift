@@ -48,11 +48,11 @@ struct FakeAnswer: Sendable {
     static let noContent = FakeAnswer(status: 204, body: nil)
     static let networkError = FakeAnswer(status: 0, body: nil, offline: true)
     /// Kirora's 400 for a request whose body (or `in`) fields are invalid, naming each.
-    static func validationError(fields: [String], in part: String = "body") -> FakeAnswer {
+    static func validationError(fields: [String], in part: String = "body", status: Int = 400) -> FakeAnswer {
         let errors = fields.map { field -> JSONValue in
             .object(["in": .string(part), "field": .string(field), "code": .string("custom"), "message": .string("invalid")])
         }
-        return FakeAnswer(status: 400, body: .object(["error": .object([
+        return FakeAnswer(status: status, body: .object(["error": .object([
             "code": .string("VALIDATION_ERROR"), "message": .string("invalid"), "errors": .array(errors),
         ])]))
     }
@@ -228,9 +228,9 @@ final class TestApp: @unchecked Sendable {
     @discardableResult
     func start(
         clientKey: String = "kirora_pk_test",
-        fetchUserToken: (@Sendable () async throws -> String)? = nil,
+        fetchUserToken: (@Sendable () async throws -> String?)? = nil,
         onAuthenticationFailed: (@MainActor @Sendable (AuthenticationFailureReason) -> Void)? = nil,
-        push: PushOptions? = nil,
+        push: KiroraPushOptions? = nil,
         requireTrackingConsent: Bool = false,
         trackSessions: Bool = true,
         trackAppLifecycle: Bool = false,

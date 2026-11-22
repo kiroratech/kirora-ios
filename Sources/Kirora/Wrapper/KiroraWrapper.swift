@@ -96,7 +96,7 @@ public enum KiroraWrapper {
         private let onRequest: @Sendable (String) -> Void
         private let timeout: Double
         /// Each request waited for, with its timer, stopped once it's answered.
-        private let pending = Locked<[String: (answer: CheckedContinuation<String, Error>, timer: Task<Void, Never>?)]>([:])
+        private let pending = Locked<[String: (answer: CheckedContinuation<String?, Error>, timer: Task<Void, Never>?)]>([:])
 
         public convenience init(onRequest: @escaping @Sendable (_ requestId: String) -> Void) {
             self.init(timeout: 30, onRequest: onRequest)
@@ -108,7 +108,7 @@ public enum KiroraWrapper {
         }
 
         /// Pass as ``KiroraOptions/fetchUserToken``.
-        public func fetchUserToken() async throws -> String {
+        public func fetchUserToken() async throws -> String? {
             let id = newId()
             return try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
@@ -132,8 +132,9 @@ public enum KiroraWrapper {
             }
         }
 
-        /// The wrapper's answer to request `requestId`. Discarded if it's no longer waited for.
-        public func answer(_ requestId: String, token: String) {
+        /// The wrapper's answer to request `requestId`: `nil` or empty when the app gave no
+        /// token, a failed fetch. Discarded if it's no longer waited for.
+        public func answer(_ requestId: String, token: String?) {
             end(requestId, with: .success(token))
         }
 
@@ -145,7 +146,7 @@ public enum KiroraWrapper {
         /// Whether `requestId` is still waited for, for tests.
         func isPending(_ requestId: String) -> Bool { pending.withLock { $0[requestId] != nil } }
 
-        private func end(_ id: String, with result: Result<String, Error>) {
+        private func end(_ id: String, with result: Result<String?, Error>) {
             guard let request = pending.withLock({ $0.removeValue(forKey: id) }) else { return }
             request.timer?.cancel()
             request.answer.resume(with: result)

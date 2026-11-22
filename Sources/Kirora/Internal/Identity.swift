@@ -83,7 +83,7 @@ final class Identity: @unchecked Sendable {
     }
 
     private let state = Locked(State())
-    private let fetchUserToken: (@Sendable () async throws -> String)?
+    private let fetchUserToken: (@Sendable () async throws -> String?)?
     private let tokenTimeout: Double
     /// The device's clock, against the token's `exp`.
     private let now: @Sendable () -> Date
@@ -94,7 +94,7 @@ final class Identity: @unchecked Sendable {
     @TaskLocal static var callerHearsFailures = false
 
     init(
-        fetchUserToken: (@Sendable () async throws -> String)?, tokenTimeout: Double = 30,
+        fetchUserToken: (@Sendable () async throws -> String?)?, tokenTimeout: Double = 30,
         onAuthenticationFailed: (@MainActor @Sendable (AuthenticationFailureReason) -> Void)? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
@@ -278,11 +278,15 @@ final class Identity: @unchecked Sendable {
         guard let fetchUserToken else {
             throw KiroraError("pass identify() a user token, or set fetchUserToken")
         }
+        let token: String?
         do {
-            return try await withTimeout(seconds: tokenTimeout, fetchUserToken)
+            token = try await withTimeout(seconds: tokenTimeout, fetchUserToken)
         } catch {
             throw UserTokenError(error)
         }
+        // No token is a failed fetch, never an empty token sent to Kirora.
+        guard let token, !token.isEmpty else { throw UserTokenError(message: "fetchUserToken returned no token") }
+        return token
     }
 }
 
