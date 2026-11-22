@@ -79,10 +79,7 @@ struct DeviceId: Sendable {
     let store: KeyValueStore
 
     func value() -> String {
-        if let stored = store.string(StorageKeys.deviceId) { return stored }
-        let id = newId()
-        store.set(id, for: StorageKeys.deviceId)
-        return id
+        store.string(StorageKeys.deviceId, orSet: newId)
     }
 
     /// The id if one exists, without making one.

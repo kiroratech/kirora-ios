@@ -12,6 +12,9 @@ final class UIKitLifecycle: AppLifecycleSource, @unchecked Sendable {
     private var keepAliveTimer: Timer?
     private var monitor: NWPathMonitor?
     private var launched = false
+    /// Stopped, possibly before the main thread got to starting (a client made off the main
+    /// thread and destroyed at once): starting then does nothing.
+    private var stopped = false
     private var handler: (@Sendable (LifecycleEvent) -> Void)?
 
     func start(_ handler: @escaping @Sendable (LifecycleEvent) -> Void) {
@@ -30,6 +33,7 @@ final class UIKitLifecycle: AppLifecycleSource, @unchecked Sendable {
             }
         }
         onMain { [self] in
+            guard !stopped else { return }
             self.handler = deliver
             let center = NotificationCenter.default
             observers.append(center.addObserver(
@@ -59,6 +63,7 @@ final class UIKitLifecycle: AppLifecycleSource, @unchecked Sendable {
 
     func stop() {
         onMain { [self] in
+            stopped = true
             observers.forEach(NotificationCenter.default.removeObserver)
             observers = []
             keepAliveTimer?.invalidate()
@@ -112,13 +117,18 @@ func runWithBackgroundTime(_ name: String, _ work: @escaping @Sendable () async 
     onMain {
         let application = UIApplication.shared
         let task = Locked<UIBackgroundTaskIdentifier?>(nil)
+        let ended = Locked(false)
         // Ended once, whichever comes first: the work finishing, or iOS's time running out.
         let end: @Sendable () -> Void = {
             onMain {
+                ended.withLock { $0 = true }
                 if let identifier = task.take() { application.endBackgroundTask(identifier) }
             }
         }
-        task.withLock { $0 = application.beginBackgroundTask(withName: name, expirationHandler: end) }
+        // Begun outside the lock: iOS may call `end` before it returns, with no time left.
+        let identifier = application.beginBackgroundTask(withName: name, expirationHandler: end)
+        task.withLock { $0 = identifier }
+        if ended.current, let identifier = task.take() { application.endBackgroundTask(identifier) }
         Task {
             await work()
             end()

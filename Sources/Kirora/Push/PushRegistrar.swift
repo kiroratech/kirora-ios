@@ -109,6 +109,9 @@ struct PushRegistrationRecord: Codable, Equatable {
     var lastSeenAt: String?
     /// When (epoch ms) it was registered.
     var at: Int64
+    /// The device id it was registered as: what a detachment names, even if the id was
+    /// since forgotten. Missing in records from before it was kept.
+    var installationId: String?
     /// A detachment of this registration was started and Kirora hasn't confirmed it. The
     /// record is kept, so the device id is too (Kirora may still have the device), but it no
     /// longer counts as registered: the user signing in again registers again.
@@ -143,6 +146,9 @@ private final class Cleanup: @unchecked Sendable {
     let giveUpAt: Date
     var backoff: Backoff
     var retry: Task<Void, Never>?
+    /// Kirora's `Retry-After`, if it gave one: nothing goes before it, even when the app's
+    /// lifecycle waives the SDK's own backoff. Guarded by `cleanups`' lock, as `retry` is.
+    var serverNotBefore = Date.distantPast
 
     init(user: SignedInUser, installationId: String, lastSeenAt: String?, timing: DeliveryTiming) {
         self.user = user
@@ -205,8 +211,13 @@ final class PushRegistrar: @unchecked Sendable {
     var enabled: Bool { options != nil && platform.isSupported }
 
     /// Whether Kirora may have this device registered, so its id must be kept to detach it:
-    /// until Kirora confirms a detachment, a record is kept.
-    var registered: Bool { record != nil || cleanups.withLock { !$0.pending.isEmpty } }
+    /// registered, being registered, or being detached (a record is kept until Kirora
+    /// confirms a detachment).
+    var registered: Bool {
+        record != nil || registering.current > 0 || cleanups.withLock { !$0.pending.isEmpty }
+    }
+    /// Registrations whose `PUT /devices` is under way, not yet saved.
+    private let registering = Locked(0)
 
     /// The push app `user` is registered with, for app opens, while permission stands.
     func pushAppId(for user: SignedInUser) -> String? {
@@ -342,7 +353,7 @@ final class PushRegistrar: @unchecked Sendable {
                 record.detaching = true
                 self.save(record)
             }
-            let installationId = deviceId.value()
+            let installationId = record.installationId ?? deviceId.value()
             // Already being detached (setPushEnabled(false), then logout): one more attempt
             // of that one, now, rather than a second retry loop beside it.
             let cleanup = self.cleanups.withLock { state -> Cleanup in
@@ -379,6 +390,23 @@ final class PushRegistrar: @unchecked Sendable {
 
     private func isPending(_ cleanup: Cleanup) -> Bool {
         cleanups.withLock { !$0.stopped && $0.pending[ObjectIdentifier(cleanup)] != nil }
+    }
+
+    /// Tries every detachment still waiting at once, rather than at the SDK's own backoff:
+    /// as the app goes to the background (with time from iOS, as a suspended app retries
+    /// nothing) and comes back. One Kirora asked to wait (`Retry-After`) keeps its scheduled
+    /// retry. Returns once each has been tried.
+    func retryDetachmentsNow() async {
+        let now = Date()
+        let waiting = cleanups.withLock { state -> [Cleanup] in
+            guard !state.stopped else { return [] }
+            return state.pending.values.filter { $0.serverNotBefore <= now }.map { cleanup in
+                cleanup.retry?.cancel()
+                cleanup.retry = nil
+                return cleanup
+            }
+        }
+        for cleanup in waiting { await retry(cleanup) }
     }
 
     /// A retry of `cleanup`, in turn with registrations.
@@ -428,8 +456,13 @@ final class PushRegistrar: @unchecked Sendable {
             return
         }
         log.error("Couldn't detach this device yet; retrying in the background", error)
+        let serverNotBefore = cleanup.backoff.notBefore(waivingOwnDelay: true)
         cleanups.withLock { state in
             guard !state.stopped, state.pending[ObjectIdentifier(cleanup)] != nil else { return }
+            cleanup.serverNotBefore = serverNotBefore
+            // One retry loop per detachment: an attempt started meanwhile (the app going to
+            // the background) replaces the one waiting, never runs beside it.
+            cleanup.retry?.cancel()
             cleanup.retry = Task { [weak self] in
                 await sleep(seconds: retryAt.timeIntervalSinceNow)
                 guard !Task.isCancelled, let self else { return }
@@ -456,6 +489,10 @@ final class PushRegistrar: @unchecked Sendable {
         // Not for a user signing out: their detachment may already have run.
         let current = { self.identity.capturingUser === user }
         guard current() else { return }
+        // Counted as registered throughout, so a tracking refusal meanwhile keeps the device
+        // id this registration uses, from its configuration to the record it saves.
+        registering.withLock { $0 += 1 }
+        defer { registering.withLock { $0 -= 1 } }
         switch await platform.authorization() {
         case .notDetermined:
             return
@@ -476,7 +513,8 @@ final class PushRegistrar: @unchecked Sendable {
             // iOS is slow to answer; last launch's token is almost always still right.
             apnsToken = store.string(StorageKeys.apnsToken)
         }
-        let config = self.config()
+        let installationId = deviceId.value()
+        let config = self.config(deviceId: installationId)
         // A signed-in start costs no push calls: the kind of token comes from the last
         // registration while it's fresh, and from Kirora otherwise.
         if let record, isFresh(record, user: user, config: config) {
@@ -495,14 +533,13 @@ final class PushRegistrar: @unchecked Sendable {
         body["targetKind"] = .string(pushApp.targetKind)
         body["permission"] = .string("granted")
         body["target"] = .string(token)
-        let installationId = deviceId.value()
         let answer = try await api.request("PUT", "/devices/\(installationId)", body: JSONValue.object(body), as: user)
         // Saved even if the user changed meanwhile: it records who Kirora now has, so the
         // next user's registration (queued behind this one) isn't skipped as fresh.
         save(PushRegistrationRecord(
             userSubject: user.subject, config: config, token: token, targetKind: pushApp.targetKind,
             pushAppId: pushApp.pushAppId, permission: "granted",
-            lastSeenAt: answer?["lastSeenAt"]?.stringValue, at: epochMs(now())
+            lastSeenAt: answer?["lastSeenAt"]?.stringValue, at: epochMs(now()), installationId: installationId
         ))
         log.debug("Registered this device for push")
     }
@@ -523,7 +560,7 @@ final class PushRegistrar: @unchecked Sendable {
         body["pushAppId"] = .string(record.pushAppId)
         body["permission"] = .string("denied")
         body["lastSeenAt"] = .string(record.lastSeenAt ?? isoTimestamp(Date(timeIntervalSince1970: Double(record.at) / 1000)))
-        let installationId = deviceId.value()
+        let installationId = record.installationId ?? deviceId.value()
         do {
             let answer = try await api.request("PUT", "/devices/\(installationId)", body: JSONValue.object(body), as: user)
             record.lastSeenAt = answer?["lastSeenAt"]?.stringValue ?? record.lastSeenAt

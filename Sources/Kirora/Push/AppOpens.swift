@@ -24,6 +24,8 @@ final class AppOpens: @unchecked Sendable {
         /// The waiting opens, read once from the store and kept in step with it.
         var pending: [Pending]?
         var sending: Task<Void, Never>?
+        /// Asked to send while a send ran: it goes again once done.
+        var rerun = false
         var retry: Task<Void, Never>?
         var backoff: Backoff
         var destroyed = false
@@ -129,13 +131,23 @@ final class AppOpens: @unchecked Sendable {
         }
     }
 
-    /// Sends what waits for the signed-in user. One send at a time.
+    /// Sends what waits for the signed-in user. One send at a time; one asked for meanwhile
+    /// (another user signed in) runs once it's done.
     func send() {
         state.withLock { state in
-            guard state.sending == nil, !state.destroyed else { return }
+            guard !state.destroyed else { return }
+            guard state.sending == nil else { return state.rerun = true }
             state.sending = Task {
-                await self.sendPending()
-                self.state.withLock { $0.sending = nil }
+                repeat {
+                    await self.sendPending()
+                } while self.state.withLock { state -> Bool in
+                    defer { state.rerun = false }
+                    guard state.rerun, !state.destroyed else {
+                        state.sending = nil
+                        return false
+                    }
+                    return true
+                }
             }
         }
     }

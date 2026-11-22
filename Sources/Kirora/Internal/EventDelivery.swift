@@ -301,8 +301,12 @@ actor EventDelivery {
     /// Flushes at `at`, or sooner if one is already due then, but never before the backoff.
     private func schedule(_ at: Date) {
         guard !destroyed else { return }
-        let due = max(at, backoff.notBefore())
-        if timerAt <= due { return }
+        // An overdue timer is replaced, to go now: its sleep doesn't count time the device
+        // slept, so it may still be waiting long after `timerAt`.
+        let overdue = timerAt <= Date()
+        let due = max(overdue ? timerAt : at, backoff.notBefore())
+        // Otherwise a timer already due by then stands.
+        if !overdue, timerAt <= due { return }
         timer?.cancel()
         timerAt = due
         let delay = max(0, due.timeIntervalSinceNow)

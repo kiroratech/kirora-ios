@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Fix: signing out could leave the device registered to the user, so their pushes kept
+  arriving. The device's id was dropped when tracking was refused during a registration,
+  and signing out then detached a different id. A registration now keeps the id it was
+  made with, and a detachment still waiting is retried as the app goes to the background
+  (with time from iOS) and comes back.
+- Fix: two threads making the device id at once on a fresh install could make two.
+- Fix: an event tracked at the instant of sign-in could be left for the next user to send.
+- Fix: after the device slept, new events could wait for an older retry timer instead of
+  going within 30 seconds.
+- Fix: saved state that failed to encode removed the file, as if empty; it's now kept.
+- Fix: in the Notification Service Extension, one push running out of time cut short the
+  others the process was working on: `serviceExtensionTimeWillExpire(for:)` ends only its
+  own (`KiroraNotificationServiceExtension` uses it). A slow delivery report holds a push
+  back 5 seconds at most, not up to 20.
+- Fix: a client made off the main thread and destroyed at once left its lifecycle observers
+  and timer running; an app-open send asked for during another could wait until the next
+  foreground; asking iOS for background time could deadlock if it had none left.
 - `PushOptions` is now `KiroraPushOptions`, the name every Kirora SDK uses.
 - `fetchUserToken` may return no token: it's `async throws -> String?`. `nil` or empty is a
   failed fetch, as a throw is: `identify()` throws `UserTokenError` ("fetchUserToken

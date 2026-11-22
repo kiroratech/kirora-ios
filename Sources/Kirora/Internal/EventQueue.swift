@@ -296,7 +296,7 @@ final class EventQueue: @unchecked Sendable {
     private func persist() {
         file.write {
             let stored = self.state.withLock { $0.stored }
-            return stored.isEmpty ? nil : try? JSONEncoder().encode(stored)
+            return stored.isEmpty ? nil : try JSONEncoder().encode(stored)
         }
     }
 

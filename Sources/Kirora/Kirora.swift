@@ -397,7 +397,7 @@ public final class Kirora: @unchecked Sendable {
         if let user {
             // A choice recorded for someone else isn't this user's.
             forgetPushConsent(unlessOf: user.subject)
-            let keys = queue.adopt(user.subject)
+            let keys = tracker.adoptWaitingEvents(as: user.subject)
             adoption.withLock { $0 = keys.isEmpty || user.confirmed ? nil : (user, keys) }
         }
         // Events left by earlier sign-ins with tokens naming no one: they'd otherwise wait for
@@ -437,14 +437,20 @@ public final class Kirora: @unchecked Sendable {
             appOpens.appCameToForeground()
             // Notices notifications turned off in Settings, and refreshes a day-old registration.
             push.registerInBackground()
+            // A signed-out user's device still to detach: tried now, not at its backoff.
+            let push = self.push
+            Task { await push.retryDetachmentsNow() }
         case .background:
             if options.trackAppLifecycle { tracker.track(applicationBackgroundedEvent, properties: [:]) }
             tracker.keepSessionAlive(writeNow: true)
             appOpens.appWentToBackground()
-            // The last chance to send before iOS suspends the app.
-            let delivery = self.delivery
+            // The last chance to send, and to detach a signed-out user's device, before iOS
+            // suspends the app: nothing retries while it's suspended.
+            let delivery = self.delivery, push = self.push
             lifecycle.runInBackground("Kirora flush") {
+                async let detached: Void = push.retryDetachmentsNow()
                 await delivery.flush()
+                await detached
                 PersistentFile.waitForAllWrites()
             }
         case .keepAlive:

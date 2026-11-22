@@ -366,7 +366,7 @@ Keep the generated extension configuration and principal-class entry. Set a comp
 
 The helper attempts a delivery report, downloads an HTTPS image and registers the push's buttons before finishing. It needs neither a client key nor an App Group: reporting credentials are carried by the notification's `trackingUrl`. The report retries once on network errors, `429` or `5xx`, then is dropped. Reports are best effort and are not recovered through shared App Group storage. Extension expiry hands the available content back to iOS.
 
-For an existing extension, call `KiroraNotificationService.didReceive(_:withContentHandler:)`. If it returns `false`, handle that notification yourself and call its content handler. Forward `serviceExtensionTimeWillExpire()` to Kirora too. Keep other providers' extension processing intact.
+For an existing extension, call `KiroraNotificationService.didReceive(_:withContentHandler:)`. If it returns `false`, handle that notification yourself and call its content handler. Forward `serviceExtensionTimeWillExpire()` to Kirora too, as `KiroraNotificationService.serviceExtensionTimeWillExpire(for: request)` with the request your extension was given, so only that push is cut short. Keep other providers' extension processing intact.
 
 Reports go only to a `/t/p/…` address on Kirora's API host (under its path, if `apiUrl` has one), as in the app. The extension can't see the app's options: if the app sets `apiUrl`, add a `KiroraApiUrl` string with the same address to the **extension's** Info.plist.
 

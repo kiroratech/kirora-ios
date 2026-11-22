@@ -147,6 +147,8 @@ func withTimeout<Value: Sendable>(
                 if answer(.failure(TimeoutError())) { work.cancel() }
             }
         }
+        // Answered while the timer was being set: it has nothing left to do.
+        if answered.current { timer.take()?.cancel() }
     }
 }
 

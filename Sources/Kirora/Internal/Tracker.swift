@@ -291,6 +291,15 @@ final class Tracker: @unchecked Sendable {
         }
     }
 
+    /// Gives the events waiting for a sign-in to `owner`. Under the tracker's lock, so an
+    /// event tracked as they sign in is either tracked as theirs or adopted, never left
+    /// waiting for whoever signs in next.
+    func adoptWaitingEvents(as owner: String) -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return queue.adopt(owner)
+    }
+
     /// Ends `owner`'s visit, as they sign out: the next activity begins a new one.
     func endSession(ownedBy owner: String) {
         lock.lock()

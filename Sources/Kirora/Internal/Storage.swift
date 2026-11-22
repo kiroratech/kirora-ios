@@ -6,6 +6,9 @@ import Foundation
 protocol KeyValueStore: AnyObject, Sendable {
     func string(_ key: String) -> String?
     func set(_ value: String?, for key: String)
+    /// The value for `key`, or, with none, `make()`'s, stored: in one step, so callers on
+    /// two threads get the same value.
+    func string(_ key: String, orSet make: () -> String) -> String
     /// A change couldn't be saved: it holds in memory only, until the app is killed.
     var writeFailed: Bool { get }
     /// Whether what's saved can be read, trying it again now if it couldn't (before the
@@ -99,8 +102,9 @@ enum StorageLocation {
 /// Every client in the process uses one serial queue per file, so a client created after
 /// another reads everything that one wrote, with no client waiting for its writes.
 final class PersistentFile: @unchecked Sendable {
-    /// Encodes the state to write, or nil to remove the file.
-    typealias Contents = @Sendable () -> Data?
+    /// Encodes the state to write, or nil to remove the file. Throws if it can't be
+    /// encoded: the file is then left as it was, never removed.
+    typealias Contents = @Sendable () throws -> Data?
 
     let url: URL
     private let queue: DispatchQueue
@@ -243,7 +247,16 @@ final class PersistentFile: @unchecked Sendable {
         if scheduled { return }
         queue.async { [self] in
             guard let latest = pending.take() else { return }
-            if let data = latest() {
+            let data: Data?
+            do {
+                data = try latest()
+            } catch {
+                // The change isn't saved: the file keeps the state before it.
+                failures.withLock { $0.write = true }
+                onError(error)
+                return
+            }
+            if let data {
                 writeNow(data)
             } else if FileManager.default.fileExists(atPath: url.path) {
                 do {
@@ -330,10 +343,27 @@ final class FileKeyValueStore: KeyValueStore, @unchecked Sendable {
         loadIfNeeded()
         values.withLock { values in
             guard values?[key] != value else { return }
-            values?[key] = value
-            if file.unreadable { changedWhileUnreadable.withLock { $0[key] = .some(value) } }
-            persist()
+            store(value, for: key, in: &values)
         }
+    }
+
+    func string(_ key: String, orSet make: () -> String) -> String {
+        loadIfNeeded()
+        file.retryIfUnreadable()
+        return values.withLock { values in
+            if let existing = values?[key] { return existing }
+            let value = make()
+            store(value, for: key, in: &values)
+            return value
+        }
+    }
+
+    /// Under `values`' lock: changes `key`, notes it if the file can't be read yet, and
+    /// writes soon.
+    private func store(_ value: String?, for key: String, in values: inout [String: String]?) {
+        values?[key] = value
+        if file.unreadable { changedWhileUnreadable.withLock { $0[key] = .some(value) } }
+        persist()
     }
 
     private func loadIfNeeded() {
@@ -387,7 +417,7 @@ final class FileKeyValueStore: KeyValueStore, @unchecked Sendable {
 
     /// Encoded as they stand when the write runs, so a burst of changes is one write.
     private func persist() {
-        file.write { try? JSONEncoder().encode(self.values.withLock { $0 } ?? [:]) }
+        file.write { try JSONEncoder().encode(self.values.withLock { $0 } ?? [:]) }
     }
 
     /// On the file's queue. What can't be read is marked, so a consent answer it may have
@@ -428,6 +458,10 @@ final class WorkspaceStore: KeyValueStore, @unchecked Sendable {
         base.set(value, for: self.key(key))
     }
 
+    func string(_ key: String, orSet make: () -> String) -> String {
+        base.string(self.key(key), orSet: make)
+    }
+
     private func key(_ key: String) -> String {
         scopedKeys[key] ?? key
     }
@@ -450,6 +484,14 @@ final class MemoryKeyValueStore: KeyValueStore, @unchecked Sendable {
 
     func string(_ key: String) -> String? { values.withLock { $0[key] } }
     func set(_ value: String?, for key: String) { values.withLock { $0[key] = value } }
+    func string(_ key: String, orSet make: () -> String) -> String {
+        values.withLock { values in
+            if let existing = values[key] { return existing }
+            let value = make()
+            values[key] = value
+            return value
+        }
+    }
     var writeFailed: Bool { failures.current }
     /// Every key stored, for tests that check what the SDK keeps.
     var keys: Set<String> { values.withLock { Set($0.keys) } }

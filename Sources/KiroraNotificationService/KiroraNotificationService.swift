@@ -32,7 +32,8 @@ import UserNotifications
 /// }
 ///
 /// override func serviceExtensionTimeWillExpire() {
-///     KiroraNotificationService.serviceExtensionTimeWillExpire()
+///     // The request this extension instance was given in didReceive.
+///     KiroraNotificationService.serviceExtensionTimeWillExpire(for: request)
 /// }
 /// ```
 public enum KiroraNotificationService {
@@ -61,15 +62,24 @@ public enum KiroraNotificationService {
             let buttons = Task { if let buttonCategory { await register(buttonCategory) } }
             if let imageUrl, let attachment = await downloadAttachment(imageUrl) { delivery.attach(attachment) }
             await buttons.value
-            await reporting.value
+            // The report isn't worth holding the notification back long for: it goes on
+            // after, while iOS keeps the extension running.
+            await wait(for: reporting, upTo: reportWait)
             delivery.finish()
             active.withLock { _ = $0.removeValue(forKey: id) }
         }
         return true
     }
 
+    /// iOS is about to stop the extension instance that was given `request`: shows that push
+    /// as it stands. Other pushes the process is working on go on.
+    public static func serviceExtensionTimeWillExpire(for request: UNNotificationRequest) {
+        active.withLock { $0.removeValue(forKey: request.identifier) }?.finish()
+    }
+
     /// iOS is about to stop the extension: shows every Kirora push still being worked on
-    /// as it stands.
+    /// as it stands, including other instances' in the same process. Prefer
+    /// ``serviceExtensionTimeWillExpire(for:)`` when the extension keeps its request.
     public static func serviceExtensionTimeWillExpire() {
         let deliveries = active.withLock { active -> [PendingDelivery] in
             defer { active.removeAll() }
@@ -229,6 +239,32 @@ public enum KiroraNotificationService {
     /// The pushes being worked on, by request id.
     private static let active = Locked<[String: PendingDelivery]>([:])
 
+    /// How long a finished push waits for its delivery report before it's shown.
+    static let reportWait: Double = 5
+
+    /// Waits for `task` up to `seconds`, then goes on without it; it keeps running.
+    static func wait(for task: Task<Void, Never>, upTo seconds: Double) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let resumed = Locked(false)
+            let resume: @Sendable () -> Void = {
+                let first = resumed.withLock { resumed -> Bool in
+                    defer { resumed = true }
+                    return !resumed
+                }
+                if first { continuation.resume() }
+            }
+            let timer = Task {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                resume()
+            }
+            Task {
+                await task.value
+                timer.cancel()
+                resume()
+            }
+        }
+    }
+
     /// Posts `delivered` to the push's own `trackingUrl`, which names the device and needs
     /// no credentials. A best-effort count: a network error, 429 or 5xx is tried once more,
     /// then dropped. A push without one (a test send) reports nothing.
@@ -321,17 +357,28 @@ private final class PendingDelivery: @unchecked Sendable {
 /// through unchanged. Subclass it as your extension's principal class; override
 /// `didReceive` to handle other pushes, calling `super` for Kirora's.
 open class KiroraNotificationServiceExtension: UNNotificationServiceExtension {
+    /// This instance's push: iOS runs one instance per push, and may run several in one
+    /// process.
+    private var request: UNNotificationRequest?
+
     override open func didReceive(
         _ request: UNNotificationRequest,
         withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
     ) {
+        self.request = request
         if !KiroraNotificationService.didReceive(request, withContentHandler: contentHandler) {
             contentHandler(request.content)
         }
     }
 
     override open func serviceExtensionTimeWillExpire() {
-        KiroraNotificationService.serviceExtensionTimeWillExpire()
+        if let request {
+            KiroraNotificationService.serviceExtensionTimeWillExpire(for: request)
+        } else {
+            // A subclass that handled the push without calling `super.didReceive`: which push
+            // was this instance's isn't known, so every one still being worked on is shown.
+            KiroraNotificationService.serviceExtensionTimeWillExpire()
+        }
     }
 }
 
