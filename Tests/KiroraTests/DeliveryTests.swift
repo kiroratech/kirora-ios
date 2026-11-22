@@ -190,8 +190,10 @@ struct DeliveryTests {
         for index in 0..<200 { kirora.track("Event \(index)") }
         // Signing in starts one pass.
         try await kirora.identify(userToken("user-1"))
+        #expect(await eventually { kirora.getState().queuedEventCount == 199 })
+        // One event isolated in 8 requests, then one more full batch refused: then the wait,
+        // with no more dropped meanwhile.
         await settle(0.3)
-        // One event isolated in 8 requests, then one more full batch refused: then the wait.
         #expect(app.server.batches.count <= 10)
         #expect(kirora.getState().queuedEventCount == 199)
     }

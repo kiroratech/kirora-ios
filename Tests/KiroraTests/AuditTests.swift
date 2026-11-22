@@ -91,6 +91,8 @@ struct AuditTests {
     /// background, with time from iOS, rather than waiting for its backoff while suspended.
     @Test func goingToTheBackgroundRetriesADetachment() async throws {
         let app = TestApp()
+        // Its own retry a minute away: only going to the background tries it again.
+        app.timing = DeliveryTiming(flushInterval: 60, maxRetryDelay: 60)
         let offline = Locked(true)
         app.server.answer { $0.method == "DELETE" && offline.current ? .networkError : nil }
         let kirora = app.start(push: .enabled)
