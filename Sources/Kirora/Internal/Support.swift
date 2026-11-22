@@ -182,6 +182,27 @@ func askWithFallback<Value: Sendable>(
 }
 
 /// Opened once; until then, callers wait for it, each up to its own limit.
+/// Runs operations one at a time, each after the one before it has finished (or failed).
+final class InTurn: @unchecked Sendable {
+    private let last = Locked<Task<Void, Never>?>(nil)
+
+    func run(_ operation: @escaping @Sendable () async throws -> Void) async throws {
+        let mine: Task<Void, Error> = last.withLock { last in
+            let previous = last
+            let task = Task {
+                await previous?.value
+                try await operation()
+            }
+            last = Task { _ = try? await task.value }
+            return task
+        }
+        try await mine.value
+    }
+
+    /// Waits for the operations asked for so far.
+    func done() async { await last.current?.value }
+}
+
 final class Gate: @unchecked Sendable {
     private let state = Locked<(open: Bool, waiting: [UUID: CheckedContinuation<Void, Never>])>((false, [:]))
 

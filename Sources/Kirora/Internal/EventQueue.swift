@@ -186,12 +186,13 @@ final class EventQueue: @unchecked Sendable {
     /// Makes the events from before sign-in `owner`'s, as they sign in: from now on they go
     /// as `owner` or not at all, whoever signs in next. Returns their idempotency keys, for
     /// ``release(_:owner:)``.
-    func adopt(_ owner: String) -> Set<String> {
+    func adopt(_ owner: String, where include: (String) -> Bool = { _ in true }) -> Set<String> {
         loadIfNeeded()
         return state.withLock { state in
             var adopted = Set<String>()
             let change = ownerBytes(owner)
-            for index in state.stored.indices where state.stored[index].owner == nil {
+            for index in state.stored.indices
+            where state.stored[index].owner == nil && include(state.stored[index].event.idempotencyKey) {
                 let entry = state.stored[index]
                 if let sessionOwner = entry.sessionOwner, sessionOwner != owner {
                     state.replace(at: index, with: entry.adopted(by: owner))
@@ -294,6 +295,14 @@ final class EventQueue: @unchecked Sendable {
             if state.stored.count != before, state.loaded { persist() }
         }
     }
+
+    /// Reads the file now if it hasn't been: before taking a lock that `track()` waits on, so
+    /// that wait is never a disk read.
+    func preload() { loadIfNeeded() }
+
+    /// Writes the events now rather than when their spacing allows: before the app is
+    /// suspended.
+    func writesDone() async { await file.writesDone() }
 
     private func loadIfNeeded() {
         if !state.withLock({ $0.loaded }) { file.readNow { load($0) } }

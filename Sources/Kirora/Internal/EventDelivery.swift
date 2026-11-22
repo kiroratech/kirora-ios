@@ -88,7 +88,7 @@ actor EventDelivery {
 
     /// After an event is queued: send at once if enough wait, otherwise soon.
     func onEventQueued(waiting: Int) {
-        guard let user = identity.user, !user.tokenRefused, !destroyed else { return }
+        guard identity.sendingUser != nil, !destroyed else { return }
         if waiting >= timing.flushAtEvents {
             Task { await self.flushWhenDue() }
         } else {
@@ -154,20 +154,32 @@ actor EventDelivery {
         guard let user = identity.user else { return }
         sendingAs = user
         var maxEvents = eventBatchSize
+        // An event refused alone in this pass, with none accepted since.
+        var refusedOne = false
         while mayStillSend(as: user) {
             let batch = fitBatch(queue.oldest(maxEvents, owner: user.subject))
             if batch.isEmpty { return }
             let outcome = await sendBatch(batch, as: user)
             switch outcome {
             case .split:
+                // Another refused event right after one: paced, as a refusal every event
+                // meets (a field Kirora no longer takes) would otherwise drop them all at once,
+                // with a burst of requests for each.
+                if refusedOne {
+                    log.error("Events refused again; retrying later")
+                    schedule(backoff.failed(nil))
+                    return
+                }
                 maxEvents = (batch.count + 1) / 2
                 continue
             case .stop:
                 return
-            case .settled(let keys):
+            case .settled(let keys, let refused):
                 queue.remove(keys)
                 // Past the event a split isolated, the rest go in full batches again.
                 maxEvents = eventBatchSize
+                refusedOne = refused
+                if refused { continue }
                 if keys.count < batch.count {
                     log.error("Some events weren't accepted yet; retrying them")
                     schedule(backoff.failed(nil))
@@ -179,12 +191,12 @@ actor EventDelivery {
     }
 
     private func mayStillSend(as user: SignedInUser) -> Bool {
-        identity.user === user && !user.tokenRefused && !destroyed && consentAllowed()
+        identity.sendingUser === user && !destroyed && consentAllowed()
     }
 
     private enum Outcome {
-        /// The events sent, or refused for good.
-        case settled(Set<String>)
+        /// The events sent, or refused for good; `refused`: one event a split isolated.
+        case settled(Set<String>, refused: Bool = false)
         case split
         case stop
     }
@@ -234,7 +246,7 @@ actor EventDelivery {
             // Retry in halves until the bad event is alone, so the rest of the batch still goes.
             if batchKeys.count > 1 { return .split }
             log.error("Event dropped: Kirora refused it", apiError)
-            return .settled(batchKeys)
+            return .settled(batchKeys, refused: true)
         }
         // The plan doesn't take these events: a terminal refusal of the feature.
         if apiError.status == 403, apiError.code == "PLAN_FEATURE_UNAVAILABLE" {

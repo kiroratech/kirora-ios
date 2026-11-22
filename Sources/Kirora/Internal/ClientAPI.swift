@@ -110,6 +110,15 @@ final class ClientAPI: Sendable {
         guard let user = requestedUser ?? identity.user else {
             throw KiroraError("call identify() with a user token first")
         }
+        // Refused with nothing to replace it: nothing goes as them again, app opens and
+        // device registration included, until identify() signs in with a new token. A
+        // detachment goes on with the device's secret instead.
+        if user.tokenRefused {
+            throw KiroraApiError(
+                status: 401, code: "UNAUTHORIZED",
+                message: "Kirora refused the user's token; call identify() with a new one"
+            )
+        }
         let request = try makeRequest(baseURL, method, path, query, body)
         let sentToken = user.token
         do {

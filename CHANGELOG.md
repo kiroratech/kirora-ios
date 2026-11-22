@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- The event queue file is written at most once a second, and at once as the app goes to
+  the background, rather than after every event: each write holds the whole queue (up to
+  1 MB). A crash can lose up to the last second of events.
+- Push: when the SDK adds the APNs token callbacks to an app delegate that lacks them,
+  it sets the delegate again, so UIKit sees them (as Firebase does). Before, such an app
+  could get no token and never register.
+- The background flush writes the client's event file without holding a thread, and no longer waits on every Kirora file in the process.
+- Fix: during `logout()`, a sign-in already under way adopted events tracked during the
+  logout, an `identify()` made during it adopted the outgoing user's waiting events, and
+  two overlapping logouts could leave a user signed in. Waiting events are now held for
+  the sign-in under way as the logout began, and logouts run one after another.
+- Fix: a refusal every event met (a field Kirora stopped taking) split batches down to one
+  event over and over with no delay, sending thousands of requests and emptying the queue.
+  After one event is refused alone, another refusal now waits for the backoff.
+- Fix: a tap on a push that replaced an earlier one with the same collapse id was ignored
+  as already handled; a tap on one of the app's own notification actions was reported as
+  an open; and the extension could lose track of two such pushes handled at once.
+- `track()` no longer waits behind a read of the events file while a sign-in or logout
+  adopts or clears waiting events.
+- Fix: an `identify()` made while `logout()` waited for a sign-in under way was signed
+  out by that logout, or abandoned with it if that wait ran out; with nobody signed in as
+  the logout began, its push registration was also detached. A logout now signs out only
+  sign-ins made before it, and events tracked once it begins wait for the next user.
+- Fix: once Kirora refused a token with no `fetchUserToken` to replace it, only events
+  stopped; app opens, push registration and `setPushConsent(_:)` kept trying as that user.
+  Now every request as that user waits for `identify()` with a new token
+  (`setPushConsent(_:)` throws the 401). Detaching goes on with the device secret.
 - Fix: signing out after a relaunch, before `identify()`, left the device registered to the
   user, so their pushes kept arriving. The SDK now makes a device secret once per
   installation (32 random bytes, kept with the device id) and sends it with every push

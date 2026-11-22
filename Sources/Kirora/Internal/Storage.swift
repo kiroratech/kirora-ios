@@ -130,28 +130,55 @@ final class PersistentFile: @unchecked Sendable {
     private let lastRetry = Locked<Date?>(nil)
     private static let retryEvery: Double = 2
 
-    private static let queues = Locked<[String: DispatchQueue]>([:])
+    /// Each path's queue, and every instance of it alive: a read or wait on one writes what
+    /// any of them holds back first (a client released with a write still spaced out, say).
+    private static let paths = Locked<[String: (queue: DispatchQueue, files: [Weak<PersistentFile>])]>([:])
 
-    init(url: URL, onError: @escaping @Sendable (Error) -> Void) {
+    /// The least time between two writes. Zero writes as soon as the queue gets to it; the
+    /// event queue spaces them, as each rewrites every event waiting. Whatever is held back
+    /// is written before the file is read, and by ``waitForWrites()``.
+    private let writeSpacing: Double
+    /// When the last write ran (uptime), for the spacing.
+    private let lastWrite = Locked<Double>(0)
+
+    init(url: URL, writeSpacing: Double = 0, onError: @escaping @Sendable (Error) -> Void) {
         self.url = url
+        self.writeSpacing = writeSpacing
         self.onError = onError
-        queue = Self.queues.withLock { queues in
-            if let queue = queues[url.path] { return queue }
+        queue = Self.paths.withLock { paths in
+            if let queue = paths[url.path]?.queue { return queue }
             let queue = DispatchQueue(label: "io.kirora.sdk.file.\(url.lastPathComponent)", qos: .utility)
-            queues[url.path] = queue
+            paths[url.path] = (queue, [])
             return queue
+        }
+        let weak = Weak(self)
+        Self.paths.withLock { paths in
+            paths[url.path]?.files.removeAll { $0.value == nil }
+            paths[url.path]?.files.append(weak)
         }
     }
 
     /// Runs `body` on the file's queue with the file as it stands after every write asked
     /// for so far, by any client, and waits for it. `body` may call ``writeNow(_:)``.
     func readNow<Result>(_ body: (Data?) -> Result) -> Result {
-        queue.sync { body(read()) }
+        queue.sync {
+            Self.writeHeldBack(url.path)
+            return body(read())
+        }
     }
 
     /// As ``readNow(_:)``, without waiting.
     func readSoon(_ body: @escaping @Sendable (Data?) -> Void) {
-        queue.async { [self] in body(read()) }
+        queue.async { [self] in
+            Self.writeHeldBack(url.path)
+            body(read())
+        }
+    }
+
+    /// On the path's queue: writes now what every instance of it holds back.
+    private static func writeHeldBack(_ path: String) {
+        let files = paths.withLock { $0[path]?.files.compactMap(\.value) ?? [] }
+        for file in files { file.writePending() }
     }
 
     /// The file's contents, or nil if there's none or it can't be read (noted).
@@ -248,39 +275,54 @@ final class PersistentFile: @unchecked Sendable {
             return pending != nil
         }
         if scheduled { return }
-        queue.async { [self] in
-            guard let latest = pending.take() else { return }
-            let data: Data?
+        let wait = lastWrite.current + writeSpacing - ProcessInfo.processInfo.systemUptime
+        if wait > 0 {
+            queue.asyncAfter(deadline: .now() + wait) { [self] in writePending() }
+        } else {
+            queue.async { [self] in writePending() }
+        }
+    }
+
+    /// On the queue: writes the latest state asked for, if a write is pending.
+    private func writePending() {
+        guard let latest = pending.take() else { return }
+        lastWrite.withLock { $0 = ProcessInfo.processInfo.systemUptime }
+        let data: Data?
+        do {
+            data = try latest()
+        } catch {
+            // The change isn't saved: the file keeps the state before it.
+            failures.withLock { $0.write = true }
+            onError(error)
+            return
+        }
+        if let data {
+            writeNow(data)
+        } else if FileManager.default.fileExists(atPath: url.path) {
             do {
-                data = try latest()
+                try FileManager.default.removeItem(at: url)
+                failures.withLock { $0.write = false }
             } catch {
-                // The change isn't saved: the file keeps the state before it.
                 failures.withLock { $0.write = true }
                 onError(error)
-                return
-            }
-            if let data {
-                writeNow(data)
-            } else if FileManager.default.fileExists(atPath: url.path) {
-                do {
-                    try FileManager.default.removeItem(at: url)
-                    failures.withLock { $0.write = false }
-                } catch {
-                    failures.withLock { $0.write = true }
-                    onError(error)
-                }
             }
         }
     }
 
     /// Waits for writes already asked for. Never on the app's own thread.
     func waitForWrites() {
-        queue.sync {}
+        queue.sync { Self.writeHeldBack(url.path) }
     }
 
-    /// Waits for every file's writes, by every client, e.g. before the app is suspended.
-    static func waitForAllWrites() {
-        for queue in queues.withLock({ Array($0.values) }) { queue.sync {} }
+    /// As ``waitForWrites()``, from async code (before the app is suspended, say): no thread
+    /// is held while the writes run.
+    func writesDone() async {
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            queue.async { [self] in
+                Self.writeHeldBack(url.path)
+                done.resume()
+            }
+        }
     }
 
     /// Makes the directory, left out of iCloud and iTunes backups so a restored phone gets
@@ -295,19 +337,22 @@ final class PersistentFile: @unchecked Sendable {
     }
 }
 
+/// A reference that doesn't keep its object alive.
+private final class Weak<Value: AnyObject>: @unchecked Sendable {
+    weak var value: Value?
+    init(_ value: Value) { self.value = value }
+}
+
 /// One instance per file in the process, while any client holds it: each instance keeps the
 /// whole file in memory and writes it whole, so two would overwrite each other's changes.
 final class SharedPerFile<Value: AnyObject>: @unchecked Sendable {
-    private final class Weak { weak var value: Value? }
-    private let instances = Locked<[String: Weak]>([:])
+    private let instances = Locked<[String: Weak<Value>]>([:])
 
     func instance(for url: URL, make: () -> Value) -> Value {
         instances.withLock { instances in
             if let existing = instances[url.path]?.value { return existing }
             let made = make()
-            let box = Weak()
-            box.value = made
-            instances[url.path] = box
+            instances[url.path] = Weak(made)
             return made
         }
     }

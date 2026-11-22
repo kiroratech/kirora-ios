@@ -40,6 +40,8 @@ public final class Kirora: @unchecked Sendable {
     /// The events a sign-in adopted, given back if Kirora refuses its token before ever
     /// accepting it.
     private let adoption = Locked<(user: SignedInUser, keys: Set<String>)?>(nil)
+    /// Logouts, one after another.
+    private let logouts = InTurn()
 
     /// Starts the client. Never throws and never blocks the app's launch: a bad option is
     /// logged, and the client then sends nothing.
@@ -181,47 +183,46 @@ public final class Kirora: @unchecked Sendable {
     /// can't be reached, the SDK keeps trying to detach the device in the background, and
     /// the user is forgotten all the same.
     public func logout() async {
+        // One at a time, each after the last, with its own deadline: a logout's wait for a
+        // sign-in is its own.
+        try? await logouts.run { await self.logOut(by: Date().addingTimeInterval(self.logoutWait)) }
+    }
+
+    private func logOut(by deadline: Date) async {
         guard !destroyed else { return }
-        // One deadline for all of it, a sign-in still under way included.
-        let deadline = Date().addingTimeInterval(logoutWait)
         let identity = self.identity
         // Events waiting for a sign-in may be the outgoing user's, signed in to the SDK or
-        // not (an app that restored its own session): never the next user's. Noted now, so
-        // what's tracked during the logout still waits for the next user.
-        let waiting = tracker.waitingEvents()
+        // not (an app that restored its own session): never the next user's. Held now, for
+        // a sign-in already under way at most, so what's tracked during the logout, or a
+        // later identify(), doesn't take them.
+        // Nothing tracked from now on joins whoever is signed in, or whoever a sign-in under
+        // way signs in: it waits for the next user. An identify() made during the logout
+        // comes after it, and stays.
+        let (current, signIn, call) = tracker.holdWaitingEvents(beginningLogout: identity.beginLogout)
+        if let current { tracker.endSession(ownedBy: current.subject) }
         // Otherwise that sign-in's push registration could land after the detachment.
-        let signInSettled = (try? await withTimeout(seconds: logoutWait) { await identity.settled() }) != nil
+        let signInSettled = await finish(by: deadline) { _ = try? await signIn?.value }
         // Still waiting for its token: it never signs anyone in now, so it can't bring the
         // user back after this logout. Whoever is signed in is signed out as usual.
-        if !signInSettled { identity.abandonPendingSignIn() }
+        if !signInSettled { identity.abandonSignIn(call) }
+        let signedIn = identity.leavingUser
         // Dropped once a sign-in under way has had its chance to adopt them.
-        tracker.forget(waiting, onlyOnSignedInVisits: identity.user == nil)
-        guard let user = identity.user else {
+        tracker.releaseHeldEvents(forgettingOnlyOnSignedInVisits: signedIn == nil)
+        guard let user = signedIn else {
             // Nobody signed in (the app restored its own session after a relaunch): the
             // device's last registration is still detached, by its device secret.
             let push = self.push
-            let detach = Task { await push.detachLastRegistration(deadline: deadline) }
-            let remaining = deadline.timeIntervalSinceNow
-            if remaining > 0 { _ = try? await withTimeout(seconds: remaining) { await detach.value } }
+            _ = await finish(by: deadline) { await push.detach(as: nil, deadline: deadline) }
             return
         }
-        // Nothing tracked from now on joins the outgoing user, or their visit: it waits for
-        // the next one.
-        identity.beginSignOut(user)
-        tracker.endSession(ownedBy: user.subject)
         // Past the deadline, the user is forgotten all the same, and a detachment still under
         // way carries on in the background, behind any registration it must follow.
         let delivery = self.delivery, push = self.push
-        let sendAndDetach = Task {
+        let finished = await finish(by: deadline) {
             // Independent: the detachment waits only for registrations, not for events.
             async let sent: Void = delivery.flush()
-            await push.detach(user, deadline: deadline)
+            await push.detach(as: user, deadline: deadline)
             await sent
-        }
-        let remaining = deadline.timeIntervalSinceNow
-        var finished = false
-        if remaining > 0 {
-            finished = (try? await withTimeout(seconds: remaining) { await sendAndDetach.value }) != nil
         }
         // Out of time: a send still under way is cancelled (its events go with the user). The
         // detachment's own request is cancelled at the same deadline, then retried.
@@ -229,13 +230,23 @@ public final class Kirora: @unchecked Sendable {
         let signedOut = identity.signOut(user)
         // Anything left is this user's, so it never goes as the next one; but if they
         // signed in again meanwhile, it's theirs to send.
-        if identity.user?.subject != user.subject {
+        let nowSignedIn = identity.user?.subject
+        if nowSignedIn != user.subject {
             tracker.forgetEvents(ownedBy: user.subject)
             appOpens.clear(owner: user.subject)
-            forgetPushConsent(unlessOf: identity.user?.subject)
+            forgetPushConsent(unlessOf: nowSignedIn)
         }
         if signedOut { tracker.endSession(ownedBy: user.subject) }
         adoption.withLock { if $0?.user === user { $0 = nil } }
+    }
+
+    /// Runs `work` in a task of its own and waits for it until `deadline`; past it, the work
+    /// carries on in the background. True if it finished in time.
+    private func finish(by deadline: Date, _ work: @escaping @Sendable () async -> Void) async -> Bool {
+        let task = Task { await work() }
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { return false }
+        return (try? await withTimeout(seconds: remaining) { await task.value }) != nil
     }
 
     /// Queues an event, with a copy of `properties` as they are now. Returns at once and
@@ -409,12 +420,15 @@ public final class Kirora: @unchecked Sendable {
     /// Once signed in: send what waits, and register this device for push.
     private func onSignedIn() async throws {
         let user = identity.user
+        // Leaving: signed in by a sign-in under way as a logout began, which signs them out.
+        var leaving = false
         // What was tracked before sign-in is this user's from now on, whoever signs in next,
         // unless Kirora refuses their token before accepting it once.
         if let user {
             // A choice recorded for someone else isn't this user's.
             forgetPushConsent(unlessOf: user.subject)
-            let keys = tracker.adoptWaitingEvents(as: user.subject)
+            let keys: Set<String>
+            (keys, leaving) = tracker.adoptWaitingEvents(as: user)
             adoption.withLock { $0 = keys.isEmpty || user.confirmed ? nil : (user, keys) }
         }
         // Events left by earlier sign-ins with tokens naming no one: they'd otherwise wait for
@@ -434,7 +448,7 @@ public final class Kirora: @unchecked Sendable {
         } catch {
             log.error("Push registration failed", error)
         }
-        if let user { appOpens.onSignedIn(user) }
+        if let user, !leaving { appOpens.onSignedIn(user) }
     }
 
     private func handle(_ event: LifecycleEvent) {
@@ -463,12 +477,13 @@ public final class Kirora: @unchecked Sendable {
             appOpens.appWentToBackground()
             // The last chance to send, and to detach a signed-out user's device, before iOS
             // suspends the app: nothing retries while it's suspended.
-            let delivery = self.delivery, push = self.push
+            let delivery = self.delivery, push = self.push, queue = self.queue
             lifecycle.runInBackground("Kirora flush") {
                 async let detached: Void = push.retryDetachmentsNow()
                 await delivery.flush()
                 await detached
-                PersistentFile.waitForAllWrites()
+                // The one file whose writes are spaced out.
+                await queue.writesDone()
             }
         case .keepAlive:
             tracker.keepSessionAlive()
@@ -534,7 +549,12 @@ struct KiroraEnvironment {
             store: liveStateStore(onError: onError),
             refusals: FileKeyValueStore.shared(file: PersistentFile(url: directory.appendingPathComponent("consent.json"), onError: onError)),
             eventsFile: { namespace in
-                PersistentFile(url: directory.appendingPathComponent("events-\(fileSafe(namespace)).json"), onError: onError)
+                // At most one rewrite of every waiting event a second, however fast events come;
+                // written at once before the app is suspended (`EventQueue.writesDone()`).
+                PersistentFile(
+                    url: directory.appendingPathComponent("events-\(fileSafe(namespace)).json"),
+                    writeSpacing: 1, onError: onError
+                )
             },
             lifecycle: lifecycle,
             pushPlatform: platform,

@@ -231,8 +231,17 @@ final class Tracker: @unchecked Sendable {
     private struct Flight {
         let owner: String?
         let onSignedInVisit: Bool
+        /// Held by a logout, as it was waiting for a sign-in as the logout began.
+        var held = false
     }
     private var nextDraftId = 0
+
+    /// While a logout waits: the events that were waiting for a sign-in as it began, held
+    /// for a sign-in already under way then (one that lands leaving), and never for a later
+    /// one. Only under `lock`.
+    /// By key, each with whether it continued a signed-in user's visit; those still in
+    /// `beforeSend` are marked in ``inFlight``.
+    private var held: [String: Bool]?
 
     init(
         identity: Identity,
@@ -300,11 +309,17 @@ final class Tracker: @unchecked Sendable {
 
     /// Gives the events waiting for a sign-in to `owner`. Under the tracker's lock, so an
     /// event tracked as they sign in is either tracked as theirs or adopted, never left
-    /// waiting for whoever signs in next.
-    func adoptWaitingEvents(as owner: String) -> Set<String> {
-        lock.lock()
-        defer { lock.unlock() }
-        return queue.adopt(owner)
+    /// waiting for whoever signs in next. While a logout waits, one leaving (a sign-in under
+    /// way as it began) takes only those held for it, and any other only the rest. Returns
+    /// the keys adopted, and whether `user` is leaving; nothing for one signed out already.
+    func adoptWaitingEvents(as user: SignedInUser) -> (keys: Set<String>, leaving: Bool) {
+        withQueueLock {
+            guard identity.user === user else { return ([], true) }
+            // Read under this lock, as a logout begins under it too.
+            let leaving = identity.capturingUser !== user
+            guard let held else { return (queue.adopt(user.subject), leaving) }
+            return (queue.adopt(user.subject) { (held[$0] != nil) == leaving }, leaving)
+        }
     }
 
     /// Ends `owner`'s visit, as they sign out: the next activity begins a new one.
@@ -320,61 +335,63 @@ final class Tracker: @unchecked Sendable {
     /// inside `beforeSend`.
     @discardableResult
     func forget(if condition: () -> Bool = { true }) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard condition() else { return false }
-        queue.clearAll()
-        sessions.end()
-        inFlight = [:]
-        return true
+        withQueueLock {
+            guard condition() else { return false }
+            queue.clearAll()
+            sessions.end()
+            inFlight = [:]
+            return true
+        }
     }
 
-    /// The events waiting for a sign-in as a sign-out begins, including those being built,
-    /// and which of them continued a signed-in user's visit.
-    struct WaitingEvents {
-        fileprivate let keys: Set<String>
-        fileprivate let onSignedInVisits: Set<String>
-        fileprivate let drafts: Set<Int>
-        fileprivate let draftsOnSignedInVisits: Set<Int>
+    /// Holds the events waiting for a sign-in as a logout begins, those being built
+    /// included: only a sign-in already under way may adopt them now. `beginLogout` runs
+    /// under the same lock as adoption, so no sign-in lands between the two.
+    func holdWaitingEvents<T>(beginningLogout beginLogout: () -> T) -> T {
+        withQueueLock {
+            let (keys, onSignedInVisits) = queue.waitingKeys()
+            held = Dictionary(uniqueKeysWithValues: keys.map { ($0, onSignedInVisits.contains($0)) })
+            for id in inFlight.keys where inFlight[id]?.owner == nil { inFlight[id]?.held = true }
+            return beginLogout()
+        }
     }
 
-    func waitingEvents() -> WaitingEvents {
-        lock.lock()
-        defer { lock.unlock() }
-        let (keys, onSignedInVisits) = queue.waitingKeys()
-        let drafts = inFlight.filter { $0.value.owner == nil }
-        return WaitingEvents(
-            keys: keys, onSignedInVisits: onSignedInVisits,
-            drafts: Set(drafts.keys), draftsOnSignedInVisits: Set(drafts.filter { $0.value.onSignedInVisit }.keys)
-        )
-    }
-
-    /// Forgets those of `waiting` still waiting for a sign-in, as a sign-out ends: a sign-in
-    /// under way as it began has adopted them, if it signed in. What was tracked since waits
-    /// for the next user.
+    /// As the logout's wait ends, forgets the held events still waiting: a sign-in under way
+    /// as it began has adopted them, if it signed in. What was tracked since waits for the
+    /// next user, as do those not forgotten.
     ///
     /// With a user signed out, all of them: they were waiting as theirs. With nobody signed in
     /// (`onlyOnSignedInVisits`), only those that continued a signed-in user's visit, made by an
     /// app that restored its own session without identify(); a visitor who never signed in
     /// keeps theirs, so a logout() on a screen before sign-up can't lose them. Without visits,
     /// that can't be told, so none.
-    func forget(_ waiting: WaitingEvents, onlyOnSignedInVisits: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        queue.clearWaiting(onlyOnSignedInVisits ? waiting.onSignedInVisits : waiting.keys)
-        for id in onlyOnSignedInVisits ? waiting.draftsOnSignedInVisits : waiting.drafts
-        where inFlight[id].map({ $0.owner == nil }) == true {
-            inFlight[id] = nil
+    func releaseHeldEvents(forgettingOnlyOnSignedInVisits onlyOnSignedInVisits: Bool) {
+        withQueueLock {
+            guard let held else { return }
+            self.held = nil
+            queue.clearWaiting(Set(held.filter { !onlyOnSignedInVisits || $0.value }.keys))
+            inFlight = inFlight.filter { _, flight in
+                !(flight.held && (!onlyOnSignedInVisits || flight.onSignedInVisit))
+            }
         }
     }
 
     /// Forgets `owner`'s queued events, as they sign out, including one being built for
     /// them right now.
     func forgetEvents(ownedBy owner: String) {
+        withQueueLock {
+            queue.clearOwned { stored, _ in stored == owner }
+            inFlight = inFlight.filter { $0.value.owner != owner }
+        }
+    }
+
+    /// Runs `body` under the lock, having read the event file first: `track()` waits on the
+    /// lock, so that wait is never a disk read.
+    private func withQueueLock<T>(_ body: () -> T) -> T {
+        queue.preload()
         lock.lock()
         defer { lock.unlock() }
-        queue.clearOwned { stored, _ in stored == owner }
-        inFlight = inFlight.filter { $0.value.owner != owner }
+        return body()
     }
 
     /// Runs `body` under the lock, then passes what it built through `beforeSend` and queues
@@ -398,17 +415,22 @@ final class Tracker: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         // Those a clear didn't take while the hook ran (consent withdrawn, their user signed out).
-        let live = Set(built.map(\.id).filter { inFlight.removeValue(forKey: $0) != nil })
+        var live: [Int: Flight] = [:]
+        for draft in built { live[draft.id] = inFlight.removeValue(forKey: draft.id) }
         // The hook may have withdrawn consent.
         guard consent.allowed else { return }
-        for (draft, properties, context) in redactedEvents where live.contains(draft.id) {
-            // From before sign-in, with a sign-in since: that user adopts it, as they adopted
-            // what was queued already.
-            let owner = draft.owner ?? identity.capturingSubject
-            enqueue(QueuedEvent(
+        for (draft, properties, context) in redactedEvents {
+            guard let flight = live[draft.id] else { continue }
+            let event = QueuedEvent(
                 idempotencyKey: newId(), name: draft.name, properties: properties,
                 occurredAt: draft.occurredAt, context: context
-            ), owner: owner, sessionOwner: draft.sessionOwner)
+            )
+            // Held by a logout still waiting: it waits with the others it held, for the
+            // same end. Otherwise, from before sign-in with a sign-in since, that user adopts
+            // it, as they adopted what was queued already.
+            let isHeld = flight.held && held != nil
+            if isHeld { held?[event.idempotencyKey] = flight.onSignedInVisit }
+            enqueue(event, owner: isHeld ? nil : draft.owner ?? identity.capturingSubject, sessionOwner: draft.sessionOwner)
         }
     }
 

@@ -53,7 +53,7 @@ public enum KiroraNotificationService {
         if let category { content.categoryIdentifier = category.identifier }
         let delivery = PendingDelivery(content: content, contentHandler: contentHandler)
         let id = request.identifier
-        active.withLock { $0[id] = delivery }
+        active.withLock { $0[id, default: []].append(delivery) }
         let reportTo = trackingUrl.flatMap { trustedTrackingUrl($0, apiBase: apiBase) }
         let buttonCategory = category.map { Unchecked($0) }
         Task {
@@ -66,7 +66,11 @@ public enum KiroraNotificationService {
             // after, while iOS keeps the extension running.
             await wait(for: reporting, upTo: reportWait)
             delivery.finish()
-            active.withLock { _ = $0.removeValue(forKey: id) }
+            // Only this one: a later push with the same id (a collapse id) may be under way.
+            active.withLock { active in
+                active[id]?.removeAll { $0 === delivery }
+                if active[id]?.isEmpty == true { active[id] = nil }
+            }
         }
         return true
     }
@@ -74,7 +78,7 @@ public enum KiroraNotificationService {
     /// iOS is about to stop the extension instance that was given `request`: shows that push
     /// as it stands. Other pushes the process is working on go on.
     public static func serviceExtensionTimeWillExpire(for request: UNNotificationRequest) {
-        active.withLock { $0.removeValue(forKey: request.identifier) }?.finish()
+        active.withLock { $0.removeValue(forKey: request.identifier) }?.forEach { $0.finish() }
     }
 
     /// iOS is about to stop the extension: shows every Kirora push still being worked on
@@ -83,7 +87,7 @@ public enum KiroraNotificationService {
     public static func serviceExtensionTimeWillExpire() {
         let deliveries = active.withLock { active -> [PendingDelivery] in
             defer { active.removeAll() }
-            return Array(active.values)
+            return active.values.flatMap { $0 }
         }
         deliveries.forEach { $0.finish() }
     }
@@ -236,8 +240,9 @@ public enum KiroraNotificationService {
         return trackingUrl
     }
 
-    /// The pushes being worked on, by request id.
-    private static let active = Locked<[String: PendingDelivery]>([:])
+    /// The pushes being worked on, by request id: more than one for pushes that share a
+    /// collapse id, which iOS uses as their request id.
+    private static let active = Locked<[String: [PendingDelivery]]>([:])
 
     /// How long a finished push waits for its delivery report before it's shown.
     static let reportWait: Double = 5

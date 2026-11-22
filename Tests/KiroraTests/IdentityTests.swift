@@ -202,6 +202,191 @@ struct IdentityTests {
         #expect(sentAsA.contains("Before sign-in"))
     }
 
+    /// An identify() made while logout waits for a sign-in under way comes after the logout:
+    /// that user stays signed in.
+    @Test func anIdentifyDuringLogoutsWaitIsNotSignedOut() async throws {
+        let app = TestApp()
+        let kirora = app.start(fetchUserToken: {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            return userToken("B")
+        }, trackSessions: false)
+        try await kirora.identify(userToken("A"))
+        let signIn = Task { try? await kirora.identify() }
+        await settle(0.05)
+        let logout = Task { await kirora.logout() }
+        await settle(0.05)
+        try await kirora.identify(userToken("C"))
+        await logout.value
+        await signIn.value
+        kirora.track("After")
+        await kirora.flush()
+        let sentAsC = app.server.batches.filter { subjectOf($0.token ?? "") == "C" }.flatMap(\.eventNames)
+        #expect(sentAsC.contains("After"))
+    }
+
+    /// A slow identify() begun during the logout isn't what it waits for, nor abandoned
+    /// when that wait runs out.
+    @Test func aSlowIdentifyDuringLogoutIsNotAbandoned() async throws {
+        let app = TestApp()
+        app.logoutWait = 0.2
+        let fetches = Locked(0), loggedOut = Locked(false)
+        let kirora = app.start(fetchUserToken: {
+            let fetch = fetches.withLock { $0 += 1; return $0 }
+            if fetch == 1 {
+                // B's token outlasts the logout's wait.
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                return userToken("B")
+            }
+            // C's arrives only once the logout is over.
+            while !loggedOut.current { try await Task.sleep(nanoseconds: 10_000_000) }
+            return userToken("C")
+        }, trackSessions: false)
+        try await kirora.identify(userToken("A"))
+        let signInB = Task { try? await kirora.identify() }
+        #expect(await eventually { fetches.current == 1 })
+        let logout = Task { await kirora.logout() }
+        await settle(0.02)
+        let signInC = Task { try await kirora.identify() }
+        #expect(await eventually { fetches.current == 2 })
+        await logout.value
+        loggedOut.withLock { $0 = true }
+        try await signInC.value
+        signInB.cancel()
+        kirora.track("After")
+        await kirora.flush()
+        let sentAsC = app.server.batches.filter { subjectOf($0.token ?? "") == "C" }.flatMap(\.eventNames)
+        #expect(sentAsC.contains("After"))
+    }
+
+    /// A sign-in under way as logout began, landing during it, adopts only what was waiting
+    /// then: what's tracked during the logout is the next user's.
+    @Test func aSignInLandingDuringLogoutLeavesWhatsTrackedMeanwhile() async throws {
+        let app = TestApp()
+        let kirora = app.start(fetchUserToken: {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            return userToken("B")
+        }, trackSessions: false)
+        let signIn = Task { try? await kirora.identify() }
+        await settle(0.05)
+        let logout = Task { await kirora.logout() }
+        await settle(0.05)
+        kirora.track("During logout")
+        await logout.value
+        await signIn.value
+        try await kirora.identify(userToken("C"))
+        await kirora.flush()
+        let asB = app.server.batches.filter { subjectOf($0.token ?? "") == "B" }.flatMap(\.eventNames)
+        let asC = app.server.batches.filter { subjectOf($0.token ?? "") == "C" }.flatMap(\.eventNames)
+        #expect(!asB.contains("During logout"))
+        #expect(asC.contains("During logout"))
+    }
+
+    /// An identify() during logout never takes what was waiting as the logout began: the
+    /// outgoing user's.
+    @Test func anIdentifyDuringLogoutDoesntTakeWhatWasWaiting() async throws {
+        let app = TestApp()
+        var kirora = app.start()
+        try await kirora.identify(userToken("A"))
+        kirora.track("A's")
+        await kirora.flush()
+        kirora.destroy()
+        kirora = app.start(fetchUserToken: {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            return userToken("B")
+        })
+        let relaunched = kirora
+        relaunched.track("A's, before identify")
+        let signIn = Task { try? await relaunched.identify() }
+        await settle(0.05)
+        let logout = Task { await relaunched.logout() }
+        await settle(0.05)
+        try await relaunched.identify(userToken("C"))
+        await logout.value
+        await signIn.value
+        await relaunched.flush()
+        let asC = app.server.batches.filter { subjectOf($0.token ?? "") == "C" }.flatMap(\.eventNames)
+        #expect(!asC.contains("A's, before identify"))
+    }
+
+    /// The same for an event still in `beforeSend` as the logout begins: it's held with the
+    /// rest, not given to the identify() made during the logout.
+    @Test func anEventInBeforeSendAsLogoutBeginsIsHeldToo() async throws {
+        let app = TestApp()
+        var kirora = app.start()
+        try await kirora.identify(userToken("A"))
+        kirora.track("A's")
+        await kirora.flush()
+        kirora.destroy()
+        kirora = app.start(fetchUserToken: {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            return userToken("B")
+        }, beforeSend: { event in
+            if event.name == "Slow" { Thread.sleep(forTimeInterval: 0.2) }
+            return event
+        })
+        let relaunched = kirora
+        let tracking = Task.detached { relaunched.track("Slow") }
+        await settle(0.02)
+        let signIn = Task { try? await relaunched.identify() }
+        await settle(0.03)
+        let logout = Task { await relaunched.logout() }
+        await settle(0.03)
+        try await relaunched.identify(userToken("C"))
+        await tracking.value
+        await logout.value
+        await signIn.value
+        await relaunched.flush()
+        let asC = app.server.batches.filter { subjectOf($0.token ?? "") == "C" }.flatMap(\.eventNames)
+        #expect(!asC.contains("Slow"))
+    }
+
+    /// A second logout, called after an identify() made during the first, signs that user
+    /// out too, however the two overlap.
+    @Test func overlappingLogoutsSignOutAnIdentifyBetweenThem() async throws {
+        let app = TestApp()
+        app.logoutWait = 0.3
+        let fetches = Locked(0)
+        let kirora = app.start(fetchUserToken: {
+            let fetch = fetches.withLock { $0 += 1; return $0 }
+            if fetch == 1 { try await Task.sleep(nanoseconds: 2_000_000_000); return userToken("B") }
+            try await Task.sleep(nanoseconds: 300_000_000)
+            return userToken("C")
+        }, trackSessions: false)
+        try await kirora.identify(userToken("A"))
+        let signInB = Task { try? await kirora.identify() }
+        #expect(await eventually { fetches.current == 1 })
+        let logout1 = Task { await kirora.logout() }
+        await settle(0.1)
+        let signInC = Task { try? await kirora.identify() }
+        #expect(await eventually { fetches.current == 2 })
+        let logout2 = Task { await kirora.logout() }
+        await logout1.value
+        await logout2.value
+        await signInC.value
+        signInB.cancel()
+        #expect(!kirora.getState().isIdentified)
+    }
+
+    /// The same with nobody signed in as logout began: C's registration isn't detached by
+    /// the device secret.
+    @Test func anIdentifyDuringALogoutWithNobodySignedInKeepsItsRegistration() async throws {
+        let app = TestApp()
+        let kirora = app.start(fetchUserToken: {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            return userToken("B")
+        }, push: .enabled, trackSessions: false)
+        let signIn = Task { try? await kirora.identify() }
+        await settle(0.05)
+        let logout = Task { await kirora.logout() }
+        await settle(0.05)
+        try await kirora.identify(userToken("C"))
+        await logout.value
+        await signIn.value
+        await settle(0.1)
+        #expect(app.server.requests.filter { $0.method == "DELETE" }.isEmpty)
+        #expect(kirora.push.registered)
+    }
+
     /// Logout waits for a sign-in under way, here one that never comes. What was waiting as
     /// it began, on A's restored visit, is dropped; what's tracked during that wait is the
     /// next user's, as anything tracked during a logout is.

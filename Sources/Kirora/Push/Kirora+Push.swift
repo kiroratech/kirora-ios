@@ -78,7 +78,8 @@ extension Kirora {
     static func handleTap(_ response: UNNotificationResponse) -> Bool {
         let request = response.notification.request
         guard let payload = KiroraPushPayload(userInfo: request.content.userInfo) else { return false }
-        guard firstTimeHandling("\(request.identifier)|\(response.actionIdentifier)") else { return true }
+        guard firstTimeHandling(tapKey(request.identifier, delivered: response.notification.date, action: response.actionIdentifier))
+        else { return true }
         let action: PushTapHandler.Action
         switch response.actionIdentifier {
         case UNNotificationDefaultActionIdentifier: action = .open

@@ -104,6 +104,11 @@ struct PushTapHandler: Sendable {
     /// it, but no more than 1.5 seconds, so a slow network can't hold the app's tap event.
     func handle(_ payload: KiroraPushPayload, action: Action, tapped: (@Sendable (URL?) -> Void)? = nil) async {
         guard action != .dismiss else { return }
+        // One of the app's own actions (its category won over Kirora's buttons): not a tap
+        // on the push itself, maybe one that never opens the app, so not reported as an open.
+        // A wrapper's listener still hears it.
+        let isAppsOwn: Bool
+        if case .button(let identifier) = action { isAppsOwn = payload.buttonIndex(for: identifier) == nil } else { isAppsOwn = false }
         // Opening a link counts as a click (Kirora counts a click as an open too).
         let link: URL?
         switch action {
@@ -114,7 +119,7 @@ struct PushTapHandler: Sendable {
         let transport = self.transport
         let apiBase = self.apiBase
         let reporting = Task {
-            guard let candidate = payload.trackingUrl else { return }
+            guard !isAppsOwn, let candidate = payload.trackingUrl else { return }
             if let trackingUrl = trustedTrackingUrl(candidate, apiBase: await apiBase()) {
                 await TrackingReport.post(link == nil ? "opened" : "clicked", to: trackingUrl, transport: transport)
             }
@@ -180,6 +185,12 @@ func trustedTrackingUrl(_ trackingUrl: URL, apiBase: URL) -> URL? {
 /// Taps the SDK has handled, so a tap passed to it twice (by its own delegate proxy and by
 /// the app's manual call) is reported once.
 let handledTaps = Locked(Set<String>())
+
+/// One tap: the push's request id is shared by pushes with the same collapse id, which iOS
+/// uses as it, so the delivery's date tells a later one apart.
+func tapKey(_ requestId: String, delivered: Date, action: String) -> String {
+    "\(requestId)|\(delivered.timeIntervalSince1970)|\(action)"
+}
 
 func firstTimeHandling(_ id: String) -> Bool {
     handledTaps.withLock { handled in

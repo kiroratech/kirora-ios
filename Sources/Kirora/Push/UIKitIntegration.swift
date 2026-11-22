@@ -334,21 +334,36 @@ enum AppDelegateProxy {
             ancestor = class_getSuperclass(current)
         }
         swizzled.withLock { _ = $0.insert(ObjectIdentifier(delegateClass)) }
-        add(
+        let addedToken = add(
             to: delegateClass,
             #selector(UIApplicationDelegate.application(_:didRegisterForRemoteNotificationsWithDeviceToken:))
         ) { argument in
             if let token = argument as? Data { PushTokens.shared.received(token) }
         }
-        add(
+        let addedFailure = add(
             to: delegateClass,
             #selector(UIApplicationDelegate.application(_:didFailToRegisterForRemoteNotificationsWithError:))
         ) { _ in
             PushTokens.shared.failed()
         }
+        // UIKit notes which callbacks the delegate has as it's set: one the SDK added
+        // afterwards could go unseen, and the token never arrive. Setting the same delegate
+        // again makes UIKit look again, as Firebase does. The app keeps owning it: `delegate`
+        // holds the reference across the reset.
+        guard addedToken || addedFailure,
+              let application = UIApplication.value(forKey: "sharedApplication") as? UIApplication
+        else { return }
+        // `install` runs on the main thread (`onMain`).
+        MainActor.assumeIsolated {
+            guard application.delegate === delegate else { return }
+            application.delegate = nil
+            application.delegate = delegate
+        }
     }
 
-    private static func add(to delegateClass: AnyClass, _ selector: Selector, handler: @escaping (AnyObject) -> Void) {
+    /// Adds the SDK to `selector`'s implementation. True if the class had none (nor a
+    /// forwarding target that answers it): a method UIKit may not know about yet.
+    private static func add(to delegateClass: AnyClass, _ selector: Selector, handler: @escaping (AnyObject) -> Void) -> Bool {
         let original = class_getInstanceMethod(delegateClass, selector)
             .map { unsafeBitCast(method_getImplementation($0), to: Implementation.self) }
         let block: Block = { receiver, application, argument in
@@ -363,6 +378,7 @@ enum AppDelegateProxy {
             handler(argument)
         }
         class_replaceMethod(delegateClass, selector, imp_implementationWithBlock(block), "v@:@@")
+        return original == nil
     }
 }
 

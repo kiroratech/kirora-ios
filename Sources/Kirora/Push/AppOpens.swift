@@ -162,7 +162,7 @@ final class AppOpens: @unchecked Sendable {
     }
 
     private func sendPending() async {
-        guard let user = identity.user else { return }
+        guard let user = identity.sendingUser else { return }
         if Date() < state.withLock({ $0.backoff.notBefore() }) { return }
         // Kirora takes an app open up to 7 days old.
         let oldest = now().addingTimeInterval(-appOpenMaxAge)

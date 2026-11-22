@@ -86,6 +86,10 @@ final class FakeKirora: HTTPTransport, @unchecked Sendable {
 
     var batches: [SentRequest] { requests("POST", "/client/v1/events/batch") }
     var sentEventNames: [String] { batches.flatMap(\.eventNames) }
+    /// The names of the events sent with `subject`'s token.
+    func eventNames(sentAs subject: String) -> [String] {
+        batches.filter { subjectOf($0.token ?? "") == subject }.flatMap(\.eventNames)
+    }
 
     /// Answers calls `handler` returns an answer for; the rest as by default.
     func answer(_ handler: @escaping @Sendable (SentRequest) -> FakeAnswer?) {

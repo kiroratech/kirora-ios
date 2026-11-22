@@ -178,6 +178,24 @@ struct DeliveryTests {
         })
     }
 
+    /// A refusal every event meets is paced: one event dropped, then a backoff, not a burst
+    /// of requests that empties the queue.
+    @Test func aRefusalEveryEventMeetsDoesntEmptyTheQueue() async throws {
+        let app = TestApp()
+        app.timing = DeliveryTiming(flushAtEvents: 20, flushInterval: 5, maxRetryDelay: 5)
+        let kirora = app.start(trackSessions: false)
+        app.server.answer { request in
+            request.path.hasSuffix("/events/batch") ? .validationError(fields: ["events.0.context.x"], status: 422) : nil
+        }
+        for index in 0..<200 { kirora.track("Event \(index)") }
+        // Signing in starts one pass.
+        try await kirora.identify(userToken("user-1"))
+        await settle(0.3)
+        // One event isolated in 8 requests, then one more full batch refused: then the wait.
+        #expect(app.server.batches.count <= 10)
+        #expect(kirora.getState().queuedEventCount == 199)
+    }
+
     /// A whole request refused for something no event caused: from a wrong `apiUrl`, a proxy
     /// or captive portal, or a `Kirora-SDK` header Kirora won't take. Dropping would empty the
     /// queue, so the events wait and go once the request is accepted.
@@ -305,7 +323,7 @@ struct DeliveryTests {
         // A second store at once, as a new client would: it sees the first one's write.
         let second = FileKeyValueStore(file: PersistentFile(url: url, onError: { _ in }))
         #expect(second.string("one") == "a")
-        PersistentFile.waitForAllWrites()
+        PersistentFile(url: url, onError: { _ in }).waitForWrites()
         #expect(FileManager.default.fileExists(atPath: url.path))
     }
 

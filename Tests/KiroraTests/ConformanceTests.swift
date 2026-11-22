@@ -460,9 +460,9 @@ struct CleanupTests {
 
     @Test func aDeviceNeverRegisteredDetachesUnconditionally() async throws {
         let app = TestApp()
-        // Registered by an SDK from before `lastSeenAt` was kept.
+        // A registration Kirora answered without a `lastSeenAt`.
         app.store.set(
-            #"{"userSubject":"A","config":"","token":"abcd01","pushAppId":"\#(FakeKirora.pushAppId)","permission":"granted","at":0}"#,
+            #"{"userSubject":"A","config":"","token":"abcd01","targetKind":"apns_token","pushAppId":"\#(FakeKirora.pushAppId)","permission":"granted","at":0,"installationId":"device-1","detaching":false,"deviceSecret":"secret"}"#,
             for: StorageKeys.pushRegistration("kirora_pk_test@api.test.kirora.io")
         )
         let kirora = app.start(push: .enabled)
@@ -629,10 +629,42 @@ struct ButtonTests {
             .object(["event": .string("clicked")]), .object(["event": .string("opened")]),
         ])
     }
+
+    /// The app's own action on a Kirora push (its category won over Kirora's buttons) isn't
+    /// a tap on the push: not reported as an open.
+    @Test func theAppsOwnActionIsNotReported() async throws {
+        let server = FakeKirora()
+        let handler = PushTapHandler(transport: server, apiBase: { testApiBase }, openURL: { _ in })
+        let payload = KiroraPushPayload(userInfo: ["kirora": "true", "trackingUrl": "https://api.test.kirora.io/t/p/abc"])!
+        let heard = Locked(false)
+        await handler.handle(payload, action: .button("REPLY"), tapped: { _ in heard.withLock { $0 = true } })
+        #expect(server.requests.isEmpty)
+        // A wrapper's listener still hears it.
+        #expect(heard.current)
+    }
 }
 
 @Suite("Cancellation and shared files")
 struct CancellationTests {
+    /// A spaced file writes at most once a second; what's held back is written before any
+    /// read of the file, by any instance, and by a wait for writes.
+    @Test func aSpacedFileHoldsWritesBackUntilReadOrWaitedFor() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathComponent("events.json")
+        let file = PersistentFile(url: url, writeSpacing: 1, onError: { _ in })
+        file.write { Data("1".utf8) }
+        file.waitForWrites()
+        file.write { Data("2".utf8) }
+        Thread.sleep(forTimeInterval: 0.2)
+        #expect(try Data(contentsOf: url) == Data("1".utf8))
+        // Another instance's read sees it, as a restarted client would.
+        let other = PersistentFile(url: url, onError: { _ in })
+        #expect(other.readNow { $0 } == Data("2".utf8))
+        file.write { Data("3".utf8) }
+        other.waitForWrites()
+        #expect(try Data(contentsOf: url) == Data("3".utf8))
+    }
+
     @Test func withdrawingConsentCancelsASendUnderWay() async throws {
         let app = TestApp()
         let kirora = app.start(trackSessions: false)

@@ -38,6 +38,8 @@ final class SignedInUser: @unchecked Sendable {
     /// nothing is sent as them again. The next identify() signs in a new user.
     var tokenRefused: Bool { refusedFlag.current }
     func refuseToken() { refusedFlag.withLock { $0 = true } }
+    /// This user, unless their token was refused: nothing goes as them then.
+    var unlessRefused: SignedInUser? { tokenRefused ? nil : self }
 
     private let confirmedFlag = Locked(false)
     /// Kirora has accepted this user's token at least once.
@@ -71,6 +73,9 @@ final class Identity: @unchecked Sendable {
         /// The user `logout()` is signing out: still signed in to send and detach, but new
         /// events and app opens no longer join them.
         var leaving: SignedInUser?
+        /// The last signIn() call made before the latest logout began. A sign-in from one of
+        /// those calls lands already leaving; a later one is a new sign-in.
+        var logoutThrough = 0
         /// Refreshes the token shortly before it expires.
         var refreshTimer: Task<Void, Never>?
 
@@ -108,6 +113,10 @@ final class Identity: @unchecked Sendable {
 
     var user: SignedInUser? { state.withLock { $0.user } }
 
+    /// The signed-in user, unless Kirora refused their token with nothing to replace it (no
+    /// `fetchUserToken`): then nothing goes as them until identify() gives a new one.
+    var sendingUser: SignedInUser? { user?.unlessRefused }
+
     /// `user`'s token failed outside any call the app made: tells `onAuthenticationFailed`,
     /// once per failure (again only after a request succeeds, or a new identify()).
     ///
@@ -138,12 +147,20 @@ final class Identity: @unchecked Sendable {
 
     var capturingSubject: String? { capturingUser?.subject }
 
-    /// `user` is signing out: nothing new joins them from now on.
-    func beginSignOut(_ user: SignedInUser) {
+    /// A logout begins: nothing new joins whoever is signed in, or whoever a sign-in already
+    /// under way signs in. Returns who is signed in, and that sign-in, with its call, for
+    /// the logout to wait for.
+    func beginLogout() -> (user: SignedInUser?, signIn: Task<Void, Error>?, call: Int) {
         state.withLock { state in
-            if state.user === user { state.leaving = user }
+            state.logoutThrough = state.calls
+            state.leaving = state.user
+            return (state.user, state.signingIn, state.calls)
         }
     }
+
+    /// Whom a logout signs out: the user signed in as it began, or by a sign-in already
+    /// under way then, if still signed in.
+    var leavingUser: SignedInUser? { state.withLock { $0.leaving } }
 
     /// Signs in with `token`, or one from `fetchUserToken`, then runs `onSignedIn`. Does
     /// nothing if a later signIn() or end() has decided who's signed in meanwhile.
@@ -160,8 +177,9 @@ final class Identity: @unchecked Sendable {
                 if let token { userToken = token } else { userToken = try await self.fetchToken() }
                 let user = self.state.withLock { state -> SignedInUser? in
                     guard state.calls == call else { return nil }
-                    state.user = SignedInUser(token: userToken, now: self.now())
-                    state.leaving = nil
+                    let user = SignedInUser(token: userToken, now: self.now())
+                    state.user = user
+                    state.leaving = call <= state.logoutThrough ? user : nil
                     state.pendingRefresh = nil
                     return state.user
                 }
@@ -193,10 +211,11 @@ final class Identity: @unchecked Sendable {
         }
     }
 
-    /// Abandons a sign-in still waiting for its token, keeping whoever is signed in now: its
-    /// token, when it comes, signs no one in. Work it began once signed in carries on.
-    func abandonPendingSignIn() {
-        state.withLock { $0.calls += 1 }
+    /// Abandons the sign-in from `call` if it's still the latest, keeping whoever is signed
+    /// in now: its token, when it comes, signs no one in. A later call has already
+    /// superseded it, and is left alone. Work it began once signed in carries on.
+    func abandonSignIn(_ call: Int) {
+        state.withLock { if $0.calls == call { $0.calls += 1 } }
     }
 
     /// Waits for the latest sign-in. Its own caller handles its errors.
@@ -211,11 +230,12 @@ final class Identity: @unchecked Sendable {
     /// another call already refreshed. With no `fetchUserToken`, nothing can replace it:
     /// `user` is marked refused, and nothing is sent as them again.
     func refresh(_ user: SignedInUser, refusedToken: String) async throws -> String? {
-        guard self.user === user else { return nil }
+        // Marked even once signed out, as on web: a detachment retried as them sends nothing.
         guard fetchUserToken != nil else {
             user.refuseToken()
             return nil
         }
+        guard self.user === user else { return nil }
         if user.token != refusedToken { return user.token }
         let refresh = state.withLock { state -> Task<String, Error> in
             if let pending = state.pendingRefresh { return pending }

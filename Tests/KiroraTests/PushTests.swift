@@ -376,6 +376,33 @@ struct AppOpenTests {
         #expect(await eventually { appOpens(app).count == 2 })
     }
 
+    @Test func aTokenRefusedWithNoFetchUserTokenHoldsEveryCallUntilIdentify() async throws {
+        let app = TestApp()
+        let kirora = app.start(push: .enabled)
+        let refusing = Locked(false)
+        app.server.answer { $0.path.hasSuffix("/events/batch") && refusing.current ? .error(401, "UNAUTHORIZED") : nil }
+        app.lifecycle.fire(.launched)
+        try await kirora.identify(userToken("user-1"))
+        #expect(await eventually { appOpens(app).count == 1 })
+        // Event sending sees the refusal: nothing else goes as that user from here.
+        refusing.withLock { $0 = true }
+        kirora.track("One")
+        await kirora.flush()
+        let sent = app.server.requests.count
+        await #expect(throws: KiroraApiError.self) { try await kirora.setPushConsent(true) }
+        // A day on: both an app open and a registration refresh are due, and neither goes.
+        app.lifecycle.fire(.background)
+        app.clock.advance(25 * 60 * 60)
+        app.lifecycle.fire(.foreground)
+        await settle()
+        #expect(app.server.requests.count == sent)
+        // A new token from identify() lets them go again.
+        refusing.withLock { $0 = false }
+        try await kirora.identify(userToken("user-1", issuedAt: 1_799_999_500))
+        #expect(await eventually { appOpens(app).count == 2 })
+        try await kirora.setPushConsent(true)
+    }
+
     @Test func neverWhileSignedOutOrUnregistered() async throws {
         let app = TestApp()
         // Signed out.
@@ -583,6 +610,15 @@ struct PushReportTests {
         let id = UUID().uuidString
         #expect(firstTimeHandling(id))
         #expect(!firstTimeHandling(id))
+    }
+
+    /// Pushes sharing a collapse id share a request id: a later one is a tap of its own.
+    @Test func aLaterPushWithTheSameCollapseIdIsHandledToo() {
+        let id = UUID().uuidString
+        let action = "com.apple.UNNotificationDefaultActionIdentifier"
+        #expect(firstTimeHandling(tapKey(id, delivered: Date(timeIntervalSince1970: 1), action: action)))
+        #expect(!firstTimeHandling(tapKey(id, delivered: Date(timeIntervalSince1970: 1), action: action)))
+        #expect(firstTimeHandling(tapKey(id, delivered: Date(timeIntervalSince1970: 2), action: action)))
     }
 }
 

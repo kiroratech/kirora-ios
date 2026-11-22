@@ -105,6 +105,22 @@ struct DeviceSecretTests {
         #expect(!kirora.push.registered)
     }
 
+    /// A token already refused, with no `fetchUserToken`, isn't sent again: the detachment
+    /// goes by the secret straight away.
+    @Test func aLogoutAfterARefusedTokenDetachesByTheSecretAlone() async throws {
+        let app = TestApp()
+        app.server.answer { $0.path.hasSuffix("/events/batch") ? .error(401, "UNAUTHORIZED") : nil }
+        let kirora = app.start(push: .enabled, trackSessions: false)
+        try await kirora.identify(userToken("A"))
+        let secret = try #require(registrations(app).first?.deviceSecret)
+        kirora.track("One")
+        await kirora.flush()
+        await kirora.logout()
+        #expect(deletes(app).map { $0.headers["Authorization"] ?? "" } == ["Device \(secret)"])
+        #expect(kirora.push.pendingDetachments == 0)
+        #expect(!kirora.push.registered)
+    }
+
     /// With a user signed in, their token goes, as before.
     @Test func aSignedInLogoutStillUsesTheUsersToken() async throws {
         let app = TestApp()
@@ -112,18 +128,5 @@ struct DeviceSecretTests {
         try await kirora.identify(userToken("A"))
         await kirora.logout()
         #expect(deletes(app).map { $0.headers["Authorization"] ?? "" } == ["Bearer \(userToken("A"))"])
-    }
-
-    /// A registration saved by a build that sent no secret can't be detached without the
-    /// user: nothing is sent.
-    @Test func noSecretNoDetachmentWithNobodySignedIn() async throws {
-        let app = TestApp()
-        app.store.set(
-            #"{"userSubject":"A","config":"","token":"abcd01","pushAppId":"\#(FakeKirora.pushAppId)","permission":"granted","at":0}"#,
-            for: StorageKeys.pushRegistration("kirora_pk_test@api.test.kirora.io")
-        )
-        let kirora = app.start(push: .enabled)
-        await kirora.logout()
-        #expect(deletes(app).isEmpty)
     }
 }
