@@ -170,7 +170,7 @@ The person signed in to your app is a **contact** in Kirora, matched by the toke
 - **Goals** are measured from your own events (Starter plan and above).
 - **Campaigns** send to a list, a segment or rules; a push campaign names the push app.
 
-The SDK doesn't set contact attributes (name, email, plan): set those from your server through Kirora's API. It tracks nothing anonymously: events from before sign-in wait on the device and are sent as the next user to sign in (see [Identity and logout](#identity-and-logout)). Kirora has no anonymous contacts to merge later.
+The SDK doesn't set contact attributes (name, email, plan): set those from your server through Kirora's API. It tracks nothing anonymously: events from before sign-in wait on the device and are sent as the next user to sign in, unless they continued a signed-in user's visit and `logout()` drops them first (see [Identity and logout](#identity-and-logout)). Kirora has no anonymous contacts to merge later.
 
 ## Identity and logout
 
@@ -179,9 +179,11 @@ try await kirora.identify()      // Uses fetchUserToken.
 try await kirora.identify(token) // Uses a token you already obtained.
 ```
 
-The SDK sends no anonymous requests. Events tracked before identification, while tracking is allowed, wait on the device for the next user. Once adopted, they retain that user's identity across retries and restarts. Events captured while A is signed in never become B's events. If a never-accepted token is refused, its adopted pre-sign-in events can be released for a later sign-in.
+**Call `identify()` at every launch while your app has a signed-in user**, as well as when they sign in. Tokens aren't saved, so after a relaunch nobody is signed in to the SDK until you do; until then, events wait unsent.
 
-With `fetchUserToken`, the SDK asks for a fresh token 60 seconds before the current one's `exp`, when the app returns to the foreground after it has expired, and once when a request receives `401`. A replacement must name the same user. Tokens stay in memory; they are not written into queued events.
+The SDK sends no anonymous requests. Events tracked before identification, while tracking is allowed, wait on the device for the next user. `logout()` drops those still waiting that the signing-out user made: all of them when a user is signed in to the SDK, and with nobody signed in (an app that restored its own session without `identify()`), those that continued a signed-in user's visit. A visitor who never signed in keeps theirs; with `trackSessions: false` nothing is dropped then, as it can't be told. Once adopted, they retain that user's identity across retries and restarts. Events captured while A is signed in never become B's events. If a never-accepted token is refused, its adopted pre-sign-in events can be released for a later sign-in.
+
+With `fetchUserToken`, the SDK asks for a fresh token 60 seconds before the current one's `exp`, when the app returns to the foreground after it has expired, and once when a request receives `401`. If the device's clock is wrong (a token already expired as it arrives, or issued more than 60 seconds ahead of it), the token's lifetime is counted from when it arrived. A replacement must name the same user, in its `sub`; one without `sub` is refused. Tokens stay in memory; they are not written into queued events.
 
 A `401` that no fresh token resolves keeps the events. With `fetchUserToken`, sending backs off (to about five minutes) instead of asking for a token on every attempt; without it, nothing is sent as that token again. Either way, the next `identify()` sends them.
 
@@ -195,17 +197,19 @@ onAuthenticationFailed: { reason in
 
 With push disabled, `identify(token)` selects the token locally. Server acceptance is established by a subsequent authenticated request, not by that method returning alone.
 
-Call Kirora logout before clearing your app's own authentication:
+Call Kirora logout from your app's sign-out only, before clearing your app's own authentication. Not on other screens: with nobody signed in, it would still detach the device and drop events that continued a signed-in visit.
 
 ```swift
 await kirora.logout()
 ```
 
-Logout attempts event delivery and device detachment within a total five-second deadline, including an identification already in progress. It then clears the selected user and their remaining behavioural events. Activity captured during logout waits for the next user.
+Logout attempts event delivery and device detachment within a total five-second deadline, including an identification already in progress. It then clears the selected user, their remaining behavioural events and the waiting events described above. Activity captured during logout waits for the next user.
 
-Failed device detachment is retried in memory using the outgoing identity, with backoff, for up to 24 hours, and at once when the app goes to the background (with background time from iOS) and returns to the foreground. The request names the last successful registration's `lastSeenAt`, so a late detach cannot undo a newer registration when the server implements that contract. Ensure the deployed API supports it.
+Detaching uses the outgoing user's token as captured, never a fresh one from `fetchUserToken`. Each registration also sends the installation's device secret, 32 random bytes the SDK makes once and keeps with the device id, which can only detach the device: logout uses it when no user is signed in to the SDK (after a relaunch, before `identify()`), and when Kirora refuses the user's token.
 
-**Offline logout is not immediate server-side revocation.** Cleanup retries end when the app process ends or the client is destroyed. A request already accepted by Kirora cannot be recalled. Cleanup uses the outgoing user's token as captured and never asks `fetchUserToken` for a fresh one: a `401` ends it.
+Failed device detachment is retried with backoff for up to 24 hours, and at once when the app goes to the background (with background time from iOS) and returns to the foreground. It's saved, so it continues, by the device secret, after the app is relaunched. The request names the last successful registration's `lastSeenAt`, so a late detach cannot undo a newer registration.
+
+**Offline logout is not immediate server-side revocation:** the device is detached once Kirora can be reached. A request already accepted by Kirora cannot be recalled.
 
 ## Events and sessions
 
@@ -247,7 +251,7 @@ The synchronous hook runs once for each behavioural event, including automatic e
 
 ### Sessions and lifecycle events
 
-Sessions (visits) are enabled by default. A new visit emits `Session Started`; events carry `context.sessionId`. Activity and foreground time keep the visit alive. After 30 minutes of inactivity, the next activity starts a new visit. A relaunch can continue the stored visit; changing users starts a different user's visit. Set `trackSessions: false` to disable session events and IDs.
+Sessions (visits) are enabled by default. A new visit emits `Session Started`; events carry `context.sessionId`. Activity and foreground time keep the visit alive. After 30 minutes of inactivity, the next activity starts a new visit. A relaunch can continue the stored visit; changing users starts a different user's visit. Events tracked after a relaunch but before sign-in continue the stored visit; if a different user then signs in and takes them, they're sent without a `sessionId`, so two users' visits are never joined. Set `trackSessions: false` to disable session events and IDs.
 
 With `trackAppLifecycle: true`, the SDK also records `Application Installed`, `Application Updated`, `Application Opened` and `Application Backgrounded`. Lifecycle tracking is off by default and subject to behavioural tracking consent.
 
@@ -414,7 +418,7 @@ Without the extension, iOS delivered reports, Kirora image attachments and butto
 | Method | Result / behaviour |
 | --- | --- |
 | `identify(_ userToken: String? = nil) async throws` | Selects a user and attempts queued delivery/push registration |
-| `logout() async` | Attempts flush/detach, then clears local identity and that user's remaining events; bounded to five seconds |
+| `logout() async` | Attempts flush/detach (by the device secret with nobody signed in), then clears local identity, that user's remaining events and waiting events they made (see Identity and logout); bounded to five seconds |
 | `track(_ name: String, properties: [String: Any] = [:])` | Synchronously captures a snapshot for the queue; never throws |
 | `trackScreenView(_ name: String)` | Captures `Screen Viewed`; screens are not automatically detected |
 | `setTrackingConsent(_ granted: Bool)` | Applies and persists the tracking choice |
@@ -456,7 +460,7 @@ Files live under `Application Support/io.kirora.sdk/`. The directory is excluded
 | Storage | Contents |
 | --- | --- |
 | `events-<hash>.json` | Bounded queued event snapshots, owners and idempotency keys |
-| `state.json` | Namespaced device id, visit state, preferences, last registration, app version and pending influenced opens; APNs cache; the last `apiUrl`, for a tap that launches the app before the client exists |
+| `state.json` | Namespaced device id and device secret (which can only detach the device), visit state, preferences, last registration, app version and pending influenced opens; APNs cache; the last `apiUrl`, for a tap that launches the app before the client exists |
 | `consent.json` | Independent tracking-refusal copy |
 | Extension's `UserDefaults` | The order of Kirora's button categories, so the least recently used go first (declared in the extension's privacy manifest) |
 | Memory | User JWTs, active requests and detach retry credentials |

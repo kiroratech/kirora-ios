@@ -122,15 +122,16 @@ final class Sessions: @unchecked Sendable {
         self.now = now
     }
 
-    /// Records `owner`'s activity on the current visit. `started` is true if a new one began.
-    func touch(owner: String?) -> (sessionId: String, started: Bool) {
+    /// Records `owner`'s activity on the current visit. `started` is true if a new one began;
+    /// `visitOwner` is whose visit it is: before sign-in, a user's whose visit it continues.
+    func touch(owner: String?) -> (sessionId: String, started: Bool, visitOwner: String?) {
         state.withLock { state in
             var live = liveSessionId(&state)
             if live != nil, let owner, let current = state.current?.owner, current != owner { live = nil }
             let sessionId = live ?? newId()
             let keptOwner = owner ?? (live == nil ? nil : state.current?.owner)
             record(sessionId, owner: keptOwner, &state, writeNow: live == nil || keptOwner != state.current?.owner)
-            return (sessionId, live == nil)
+            return (sessionId, live == nil, keptOwner)
         }
     }
 
@@ -215,6 +216,7 @@ final class Tracker: @unchecked Sendable {
         let context: [String: JSONValue]
         let occurredAt: String
         let owner: String?
+        let sessionOwner: String?
         /// Its place in ``inFlight`` while `beforeSend` runs.
         let id: Int
     }
@@ -222,7 +224,14 @@ final class Tracker: @unchecked Sendable {
     /// The events `beforeSend` is running for, outside the lock, by id, with their owners.
     /// A clear under the lock (consent withdrawn, a logout) removes them here as it clears
     /// the queue, and only those still here are queued once the hook returns.
-    private var inFlight: [Int: String?] = [:]
+    private var inFlight: [Int: Flight] = [:]
+
+    /// An event `beforeSend` is running for: its owner, and whether, tracked before sign-in,
+    /// it continued a signed-in user's visit.
+    private struct Flight {
+        let owner: String?
+        let onSignedInVisit: Bool
+    }
     private var nextDraftId = 0
 
     init(
@@ -257,8 +266,7 @@ final class Tracker: @unchecked Sendable {
         exclusively {
             guard consent.allowed else { return }
             let owner = identity.capturingSubject
-            let sessionId = touchSession(owner)
-            capture(name, properties, sessionId, owner)
+            capture(name, properties, touchSession(owner), owner)
         }
     }
 
@@ -285,8 +293,7 @@ final class Tracker: @unchecked Sendable {
             guard consent.allowed else { return }
             let owner = identity.capturingSubject
             for (name, properties) in build() {
-                let sessionId = touchSession(owner)
-                capture(name, properties, sessionId, owner)
+                capture(name, properties, touchSession(owner), owner)
             }
         }
     }
@@ -322,13 +329,52 @@ final class Tracker: @unchecked Sendable {
         return true
     }
 
+    /// The events waiting for a sign-in as a sign-out begins, including those being built,
+    /// and which of them continued a signed-in user's visit.
+    struct WaitingEvents {
+        fileprivate let keys: Set<String>
+        fileprivate let onSignedInVisits: Set<String>
+        fileprivate let drafts: Set<Int>
+        fileprivate let draftsOnSignedInVisits: Set<Int>
+    }
+
+    func waitingEvents() -> WaitingEvents {
+        lock.lock()
+        defer { lock.unlock() }
+        let (keys, onSignedInVisits) = queue.waitingKeys()
+        let drafts = inFlight.filter { $0.value.owner == nil }
+        return WaitingEvents(
+            keys: keys, onSignedInVisits: onSignedInVisits,
+            drafts: Set(drafts.keys), draftsOnSignedInVisits: Set(drafts.filter { $0.value.onSignedInVisit }.keys)
+        )
+    }
+
+    /// Forgets those of `waiting` still waiting for a sign-in, as a sign-out ends: a sign-in
+    /// under way as it began has adopted them, if it signed in. What was tracked since waits
+    /// for the next user.
+    ///
+    /// With a user signed out, all of them: they were waiting as theirs. With nobody signed in
+    /// (`onlyOnSignedInVisits`), only those that continued a signed-in user's visit, made by an
+    /// app that restored its own session without identify(); a visitor who never signed in
+    /// keeps theirs, so a logout() on a screen before sign-up can't lose them. Without visits,
+    /// that can't be told, so none.
+    func forget(_ waiting: WaitingEvents, onlyOnSignedInVisits: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        queue.clearWaiting(onlyOnSignedInVisits ? waiting.onSignedInVisits : waiting.keys)
+        for id in onlyOnSignedInVisits ? waiting.draftsOnSignedInVisits : waiting.drafts
+        where inFlight[id].map({ $0.owner == nil }) == true {
+            inFlight[id] = nil
+        }
+    }
+
     /// Forgets `owner`'s queued events, as they sign out, including one being built for
     /// them right now.
     func forgetEvents(ownedBy owner: String) {
         lock.lock()
         defer { lock.unlock() }
         queue.clearOwned { stored, _ in stored == owner }
-        inFlight = inFlight.filter { $0.value != owner }
+        inFlight = inFlight.filter { $0.value.owner != owner }
     }
 
     /// Runs `body` under the lock, then passes what it built through `beforeSend` and queues
@@ -362,7 +408,7 @@ final class Tracker: @unchecked Sendable {
             enqueue(QueuedEvent(
                 idempotencyKey: newId(), name: draft.name, properties: properties,
                 occurredAt: draft.occurredAt, context: context
-            ), owner: owner)
+            ), owner: owner, sessionOwner: draft.sessionOwner)
         }
     }
 
@@ -371,37 +417,41 @@ final class Tracker: @unchecked Sendable {
         Thread.current.threadDictionary[beforeSendThreadKey] != nil
     }
 
-    /// The visit's id, if visits are on, starting one if needed.
-    private func touchSession(_ owner: String?) -> String? {
-        guard trackSessions else { return nil }
-        let (sessionId, started) = sessions.touch(owner: owner)
+    /// The visit an event joins, if visits are on, starting one if needed. `borrowedFrom`:
+    /// for one tracked before sign-in, the user whose visit it continues (after a relaunch,
+    /// say), so that if someone else adopts it, it leaves their visit.
+    private typealias Visit = (id: String?, borrowedFrom: String?)
+
+    private func touchSession(_ owner: String?) -> Visit {
+        guard trackSessions else { return (nil, nil) }
+        let (sessionId, started, visitOwner) = sessions.touch(owner: owner)
         // Mobile SDKs track `Session Started` without properties.
-        if started { capture(sessionStartedEvent, [:], sessionId, owner) }
-        return sessionId
+        if started { capture(sessionStartedEvent, [:], (sessionId, nil), owner) }
+        return (sessionId, owner == nil ? visitOwner : nil)
     }
 
     /// Makes the event and queues it as `owner`'s, or, with a `beforeSend`, leaves it for
     /// the hook outside the lock. Its time is taken first, so a slow hook doesn't move it.
     /// Under `lock`.
-    private func capture(_ name: String, _ properties: [String: JSONValue], _ sessionId: String?, _ owner: String?) {
+    private func capture(_ name: String, _ properties: [String: JSONValue], _ visit: Visit, _ owner: String?) {
         let occurredAt = isoTimestamp(now())
         // device.id will let Kirora link activity from before sign-in to the user later.
-        let context = deviceInfo.eventContext(deviceId: deviceId.value(), sessionId: sessionId)
+        let context = deviceInfo.eventContext(deviceId: deviceId.value(), sessionId: visit.id)
         guard beforeSend == nil else {
             nextDraftId += 1
-            inFlight[nextDraftId] = .some(owner)
-            drafts.append(Draft(name: name, properties: properties, context: context, occurredAt: occurredAt, owner: owner, id: nextDraftId))
+            inFlight[nextDraftId] = Flight(owner: owner, onSignedInVisit: visit.borrowedFrom != nil)
+            drafts.append(Draft(name: name, properties: properties, context: context, occurredAt: occurredAt, owner: owner, sessionOwner: visit.borrowedFrom, id: nextDraftId))
             return
         }
         enqueue(QueuedEvent(
             idempotencyKey: newId(), name: name, properties: properties,
             occurredAt: occurredAt, context: context
-        ), owner: owner)
+        ), owner: owner, sessionOwner: visit.borrowedFrom)
     }
 
     /// Under `lock`.
-    private func enqueue(_ event: QueuedEvent, owner: String?) {
-        let waiting = queue.add(event, owner: owner)
+    private func enqueue(_ event: QueuedEvent, owner: String?, sessionOwner: String?) {
+        let waiting = queue.add(event, owner: owner, sessionOwner: sessionOwner)
         log.debug("Queued \(event.name)")
         onQueued(waiting)
     }

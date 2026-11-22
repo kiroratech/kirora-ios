@@ -1291,8 +1291,8 @@ struct PushTokenStateTests {
         #expect(await kirora.getPushStatus() == .disabled)
     }
 
-    /// IOS-03: the detachment uses the outgoing user's token as captured; a 401 ends it,
-    /// without asking the app for a fresh one.
+    /// IOS-03: the detachment uses the outgoing user's token as captured, without asking the
+    /// app for a fresh one; a 401 leaves the device secret, and a 401 to that ends it.
     @Test func aDetachNeverRefreshesTheToken() async throws {
         let app = TestApp()
         let fetches = Locked(0)
@@ -1305,7 +1305,8 @@ struct PushTokenStateTests {
         await kirora.logout()
         await settle(0.3)
         #expect(fetches.current == 0)
-        #expect(app.server.requests.filter { $0.method == "DELETE" }.count == 1)
+        #expect(app.server.requests.filter { $0.method == "DELETE" }.map { $0.headers["Authorization"] ?? "" }
+            == ["Bearer \(userToken("A"))", "Device \(app.server.requests.first { $0.method == "PUT" }?.deviceSecret ?? "")"])
     }
 
     @Test func pushTurnedOffShowsNoToken() async throws {

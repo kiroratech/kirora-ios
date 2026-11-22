@@ -140,6 +140,9 @@ public final class Kirora: @unchecked Sendable {
                 self.appOpens.forget()
                 self.releaseDeviceId.ifUnneeded(registered: self.push.registered)
             }
+            // A detachment the app ended before Kirora confirmed.
+            let push = self.push
+            Task { await push.resumeDetachment() }
         }
         if push.enabled { environment.installPushIntegration(log) }
         deepLinkHandler.withLock { $0 = options.handleDeepLink }
@@ -182,12 +185,26 @@ public final class Kirora: @unchecked Sendable {
         // One deadline for all of it, a sign-in still under way included.
         let deadline = Date().addingTimeInterval(logoutWait)
         let identity = self.identity
+        // Events waiting for a sign-in may be the outgoing user's, signed in to the SDK or
+        // not (an app that restored its own session): never the next user's. Noted now, so
+        // what's tracked during the logout still waits for the next user.
+        let waiting = tracker.waitingEvents()
         // Otherwise that sign-in's push registration could land after the detachment.
         let signInSettled = (try? await withTimeout(seconds: logoutWait) { await identity.settled() }) != nil
         // Still waiting for its token: it never signs anyone in now, so it can't bring the
         // user back after this logout. Whoever is signed in is signed out as usual.
         if !signInSettled { identity.abandonPendingSignIn() }
-        guard let user = identity.user else { return }
+        // Dropped once a sign-in under way has had its chance to adopt them.
+        tracker.forget(waiting, onlyOnSignedInVisits: identity.user == nil)
+        guard let user = identity.user else {
+            // Nobody signed in (the app restored its own session after a relaunch): the
+            // device's last registration is still detached, by its device secret.
+            let push = self.push
+            let detach = Task { await push.detachLastRegistration(deadline: deadline) }
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining > 0 { _ = try? await withTimeout(seconds: remaining) { await detach.value } }
+            return
+        }
         // Nothing tracked from now on joins the outgoing user, or their visit: it waits for
         // the next one.
         identity.beginSignOut(user)

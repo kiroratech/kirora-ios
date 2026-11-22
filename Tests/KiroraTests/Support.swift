@@ -30,6 +30,8 @@ struct SentRequest: Sendable {
         return []
     }
     var eventNames: [String] { events.compactMap { $0["name"]?.stringValue } }
+    /// The `deviceSecret` a `PUT /devices` was sent with.
+    var deviceSecret: String? { body?["deviceSecret"]?.stringValue }
 }
 
 /// What the fake answers.

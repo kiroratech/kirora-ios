@@ -85,9 +85,26 @@ struct DeviceId: Sendable {
     /// The id if one exists, without making one.
     var existing: String? { store.string(StorageKeys.deviceId) }
 
+    /// The installation's `deviceSecret`, made on first use and kept as long as the id: sent
+    /// with every `PUT /devices`, it lets a sign-out detach the device with no user token
+    /// held (after a relaunch, before identify()). It can only detach.
+    func secret() -> String {
+        store.string(StorageKeys.deviceSecret, orSet: newDeviceSecret)
+    }
+
     func remove() {
         store.set(nil, for: StorageKeys.deviceId)
+        store.set(nil, for: StorageKeys.deviceSecret)
     }
+}
+
+/// 32 random bytes, base64url without padding (43 characters).
+func newDeviceSecret() -> String {
+    var generator = SystemRandomNumberGenerator()
+    let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max, using: &generator) }
+    return Data(bytes).base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
 }
 
 /// The screen, read once on the main thread as the client starts (UIKit's own only answers

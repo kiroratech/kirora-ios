@@ -4,28 +4,30 @@ import Foundation
 /// captures it, and `identity.user === user` tells whether that user is still signed in. A
 /// refreshed token replaces `token` on the same object.
 final class SignedInUser: @unchecked Sendable {
-    /// The token, and its `exp` (unverified, or nil), read once per token.
+    /// The token, and when it expires (unverified, or nil), read once per token.
     private let current: Locked<(token: String, expiry: Date?)>
     /// Tells users apart, e.g. to own their queued events: the token's `sub`, unverified
     /// (Kirora checks the signature). A token without one can't be told apart from another
     /// user's, so it gets an id of its own, new for each sign-in.
     let subject: String
-    /// The token's `sub`, or nil. A refreshed token must have the same.
+    /// The token's `sub`, or nil. A refreshed token must have the same, and one without it
+    /// is never taken.
     let tokenSubject: String?
 
-    init(token: String) {
+    /// `now`: the device's clock as the token arrives (see ``expiryOf(_:now:)``).
+    init(token: String, now: Date = Date()) {
         let claims = claimsOf(token)
-        current = Locked((token, claims.expiry))
+        current = Locked((token, expiryOf(claims, now: now)))
         tokenSubject = claims.subject
         subject = tokenSubject ?? "\(unnamedSubjectPrefix)\(newId())"
     }
 
-    var token: String {
-        get { current.current.token }
-        set {
-            let expiry = claimsOf(newValue).expiry
-            current.withLock { $0 = (newValue, expiry) }
-        }
+    var token: String { current.current.token }
+
+    /// A refreshed token, arriving at `now`, replaces this one.
+    func replaceToken(_ token: String, now: Date) {
+        let expiry = expiryOf(claimsOf(token), now: now)
+        current.withLock { $0 = (token, expiry) }
     }
 
     /// The token and its `exp`, together.
@@ -158,7 +160,7 @@ final class Identity: @unchecked Sendable {
                 if let token { userToken = token } else { userToken = try await self.fetchToken() }
                 let user = self.state.withLock { state -> SignedInUser? in
                     guard state.calls == call else { return nil }
-                    state.user = SignedInUser(token: userToken)
+                    state.user = SignedInUser(token: userToken, now: self.now())
                     state.leaving = nil
                     state.pendingRefresh = nil
                     return state.user
@@ -204,7 +206,8 @@ final class Identity: @unchecked Sendable {
     }
 
     /// A replacement for `user`'s refused token, or nil if they're no longer signed in,
-    /// there's no `fetchUserToken`, or it returned a token for someone else. Reuses a token
+    /// there's no `fetchUserToken`, or it returned a token for someone else: one whose `sub`
+    /// differs, or that has none, as it can't be told from another user's. Reuses a token
     /// another call already refreshed. With no `fetchUserToken`, nothing can replace it:
     /// `user` is marked refused, and nothing is sent as them again.
     func refresh(_ user: SignedInUser, refusedToken: String) async throws -> String? {
@@ -226,9 +229,9 @@ final class Identity: @unchecked Sendable {
             }
         }
         let token = try await refresh.value
-        guard self.user === user, subjectOf(token) == user.tokenSubject else { return nil }
+        guard self.user === user, let subject = subjectOf(token), subject == user.tokenSubject else { return nil }
         if user.token != token {
-            user.token = token
+            user.replaceToken(token, now: now())
             scheduleRefresh(for: user, atOnceIfDue: false)
         }
         return token
@@ -305,17 +308,43 @@ let tokenRefreshLead: Double = 60
 /// The JWT's `sub`, unverified, or nil.
 func subjectOf(_ token: String) -> String? { claimsOf(token).subject }
 
+/// When a token arriving at `now` stops working: its `exp`, by the device's clock.
+///
+/// One already past it as it arrives, or whose `iat` is more than ``tokenRefreshLead``
+/// ahead of `now`, meets a device clock that's off (likelier than a stale token), so its
+/// lifetime (`exp` less `iat`) is counted from now instead: otherwise it would never be
+/// refreshed ahead, or only late, and requests be refused first. Kirora's 401 still catches
+/// one that really has expired. Nil, so it waits for a refusal, if that can't be told.
+func expiryOf(_ claims: TokenClaims, now: Date) -> Date? {
+    guard let expiry = claims.expiry else { return nil }
+    let expiredOnArrival = expiry <= now
+    let issuedAhead = claims.issued.map { $0 > now.addingTimeInterval(tokenRefreshLead) } ?? false
+    guard expiredOnArrival || issuedAhead else { return expiry }
+    guard let issued = claims.issued else { return nil }
+    return now.addingTimeInterval(expiry.timeIntervalSince(issued))
+}
 
-/// The JWT's `sub` and `exp`, unverified, from one decoding.
-private func claimsOf(_ token: String) -> (subject: String?, expiry: Date?) {
+/// A JWT's claims, unverified (Kirora checks the signature).
+struct TokenClaims {
+    var subject: String?
+    var expiry: Date?
+    var issued: Date?
+}
+
+/// The JWT's `sub`, `exp` and `iat`, unverified, from one decoding.
+func claimsOf(_ token: String) -> TokenClaims {
     let parts = token.split(separator: ".", omittingEmptySubsequences: false)
-    guard parts.count >= 2 else { return (nil, nil) }
+    guard parts.count >= 2 else { return TokenClaims() }
     var base64 = parts[1].replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
     base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
     guard let data = Data(base64Encoded: base64),
           let claims = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else { return (nil, nil) }
-    let subject = (claims["sub"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-    let expiry = (claims["exp"] as? NSNumber).map(\.doubleValue).flatMap { $0.isFinite ? Date(timeIntervalSince1970: $0) : nil }
-    return (subject, expiry)
+    else { return TokenClaims() }
+    func time(_ name: String) -> Date? {
+        (claims[name] as? NSNumber).map(\.doubleValue).flatMap { $0.isFinite ? Date(timeIntervalSince1970: $0) : nil }
+    }
+    return TokenClaims(
+        subject: (claims["sub"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+        expiry: time("exp"), issued: time("iat")
+    )
 }

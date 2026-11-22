@@ -116,6 +116,14 @@ struct PushRegistrationRecord: Codable, Equatable {
     /// record is kept, so the device id is too (Kirora may still have the device), but it no
     /// longer counts as registered: the user signing in again registers again.
     var detaching: Bool?
+    /// When (epoch ms, device clock) the detachment began: one still pending after a
+    /// restart is retried until a day after it. Cleared once it's refused for good or given
+    /// up on, so it isn't resumed.
+    var detachingSince: Int64?
+    /// The installation's secret this registration was sent with, to detach it with no user
+    /// token held: a sign-out after a relaunch, before `identify()`, or a detachment retried
+    /// after one. Missing in records from before it was sent.
+    var deviceSecret: String?
 }
 
 /// Re-register at most daily for the same user, token and configuration.
@@ -129,13 +137,21 @@ private let tokenWait: Double = 10
 private let detachRetryLimit: Double = 24 * 60 * 60
 
 /// Detaching a signed-out user's device (or one turned off with `setPushEnabled(false)`),
-/// retried in the background until it's done. The user's token is kept in memory only.
+/// retried in the background until it's done. It goes with the user's token, kept in memory
+/// only, while there is one; otherwise, or once Kirora refuses it, with the registration's
+/// device secret, which the saved record keeps, so it's resumed after a restart.
 ///
 /// Every attempt names the `lastSeenAt` of the registration it undoes, so Kirora keeps any
 /// registration made since (answering 409): a late retry can't undo a newer sign-in, whoever
 /// made it. Kirora's answer, not local bookkeeping, decides when it's done.
 private final class Cleanup: @unchecked Sendable {
-    let user: SignedInUser
+    /// Whose registration it undoes: the record's `userSubject`.
+    let subject: String
+    /// The signed-out user, while their token can be used: nil with none held (a sign-out
+    /// after a relaunch, a resumed detachment), or once Kirora refused it. Guarded by
+    /// `cleanups`' lock.
+    var user: SignedInUser?
+    let deviceSecret: String?
     let installationId: String
     /// The `lastSeenAt` of the registration being undone; nil makes the detach unconditional.
     /// Kirora answers every registration with one, so only a record saved without it (by a
@@ -150,11 +166,16 @@ private final class Cleanup: @unchecked Sendable {
     /// lifecycle waives the SDK's own backoff. Guarded by `cleanups`' lock, as `retry` is.
     var serverNotBefore = Date.distantPast
 
-    init(user: SignedInUser, installationId: String, lastSeenAt: String?, timing: DeliveryTiming) {
+    init(
+        subject: String, user: SignedInUser?, deviceSecret: String?, installationId: String,
+        lastSeenAt: String?, since: Date, timing: DeliveryTiming
+    ) {
+        self.subject = subject
         self.user = user
+        self.deviceSecret = deviceSecret
         self.installationId = installationId
         self.lastSeenAt = lastSeenAt
-        giveUpAt = Date().addingTimeInterval(detachRetryLimit)
+        giveUpAt = since.addingTimeInterval(detachRetryLimit)
         backoff = Backoff(timing)
     }
 }
@@ -184,6 +205,9 @@ final class PushRegistrar: @unchecked Sendable {
     private let onDetached: @Sendable () -> Void
     /// The record as last saved, read once.
     private let cachedRecord = Locked<PushRegistrationRecord??>(nil)
+    /// A detachment began in this run: one found pending at launch is then this run's, not
+    /// one left from the last.
+    private let detachedThisRun = Locked(false)
     /// The user whose latest registration failed, for ``status()``.
     private let failedFor = Locked<SignedInUser?>(nil)
 
@@ -293,7 +317,7 @@ final class PushRegistrar: @unchecked Sendable {
             return
         }
         store.set("1", for: StorageKeys.pushDisabled)
-        if let user = identity.user { await detach(user) }
+        if let user = identity.user { await detach(user) } else { await detachLastRegistration() }
     }
 
     private var isDisabled: Bool { store.string(StorageKeys.pushDisabled) != nil }
@@ -344,32 +368,86 @@ final class PushRegistrar: @unchecked Sendable {
     /// at sign-out is detached too. The first attempt's request is cancelled at `deadline`,
     /// if given, and retried in the background like any other failure.
     func detach(_ user: SignedInUser, deadline: Date? = nil) async {
+        await detach(deadline: deadline, how: { $0.userSubject == user.subject ? .withToken(user) : .leave })
+    }
+
+    /// Detaches the device's last registration, whoever's it is, with nobody signed in (a
+    /// sign-out after a relaunch, before `identify()`): by its device secret, the only way
+    /// without the user's token. Nothing to do without one.
+    func detachLastRegistration(deadline: Date? = nil) async {
+        await detach(deadline: deadline, how: { $0.deviceSecret != nil ? .bySecret : .leave })
+    }
+
+    /// How to detach a saved registration, if at all.
+    private enum DetachAs {
+        case withToken(SignedInUser)
+        case bySecret
+        case leave
+    }
+
+    /// Detaches the saved registration as `how` says for it.
+    private func detach(deadline: Date?, how: @escaping @Sendable (PushRegistrationRecord) -> DetachAs) async {
         guard !isStopped else { return }
-        let deviceId = self.deviceId, timing = self.timing
         try? await oneAtATime {
-            guard !self.isStopped, var record = self.record, record.userSubject == user.subject else { return }
+            guard !self.isStopped, var record = self.record else { return }
+            self.detachedThisRun.withLock { $0 = true }
+            let user: SignedInUser?
+            switch how(record) {
+            case .withToken(let signedIn): user = signedIn
+            case .bySecret: user = nil
+            case .leave: return
+            }
             // No longer counts as registered; kept until Kirora confirms.
             if record.detaching != true {
                 record.detaching = true
+                record.detachingSince = epochMs(Date())
                 self.save(record)
             }
-            let installationId = record.installationId ?? deviceId.value()
-            // Already being detached (setPushEnabled(false), then logout): one more attempt
-            // of that one, now, rather than a second retry loop beside it.
-            let cleanup = self.cleanups.withLock { state -> Cleanup in
-                if let existing = state.pending.values.first(where: {
-                    $0.user.subject == user.subject && $0.installationId == installationId
-                        && $0.lastSeenAt == record.lastSeenAt
-                }) {
-                    existing.retry?.cancel()
-                    existing.retry = nil
-                    return existing
-                }
-                let cleanup = Cleanup(user: user, installationId: installationId, lastSeenAt: record.lastSeenAt, timing: timing)
-                state.pending[ObjectIdentifier(cleanup)] = cleanup
-                return cleanup
+            await self.attemptInTurn(self.cleanup(of: record, as: user), deadline: deadline)
+        }
+    }
+
+    /// A detachment left pending when the app last ended, retried with its device secret
+    /// until a day after it began. At launch, once the device's storage can be read.
+    func resumeDetachment() async {
+        guard enabled, !isStopped, store.isReadable(), let record, record.detaching == true,
+              record.detachingSince != nil, record.deviceSecret != nil
+        else { return }
+        try? await oneAtATime {
+            guard !self.detachedThisRun.current, let record = self.record, record.detaching == true,
+                  record.detachingSince != nil, record.deviceSecret != nil
+            else { return }
+            let cleanup = self.cleanup(of: record, as: nil)
+            guard Date() < cleanup.giveUpAt else {
+                self.finish(cleanup, confirmed: false)
+                return
             }
-            await self.attemptInTurn(cleanup, deadline: deadline)
+            await self.attemptInTurn(cleanup, deadline: nil)
+        }
+    }
+
+    /// The detachment of `record`, as `user` (nil: by its secret). One already pending for
+    /// it (setPushEnabled(false), then logout) is tried again now, rather than a second
+    /// retry loop beside it; it takes the user's token if it had none.
+    private func cleanup(of record: PushRegistrationRecord, as user: SignedInUser?) -> Cleanup {
+        let installationId = record.installationId ?? deviceId.value()
+        let since = record.detachingSince.map { Date(timeIntervalSince1970: Double($0) / 1000) } ?? Date()
+        return cleanups.withLock { state -> Cleanup in
+            if let existing = state.pending.values.first(where: {
+                $0.subject == record.userSubject && $0.installationId == installationId
+                    && $0.lastSeenAt == record.lastSeenAt
+            }) {
+                existing.retry?.cancel()
+                existing.retry = nil
+                if existing.user == nil, let user { existing.user = user }
+                return existing
+            }
+            let cleanup = Cleanup(
+                subject: record.userSubject, user: user, deviceSecret: record.deviceSecret,
+                installationId: installationId, lastSeenAt: record.lastSeenAt, since: since, timing: timing
+            )
+            state.pending[ObjectIdentifier(cleanup)] = cleanup
+            return cleanup
         }
     }
 
@@ -418,12 +496,15 @@ final class PushRegistrar: @unchecked Sendable {
     private func attemptInTurn(_ cleanup: Cleanup, deadline: Date?) async {
         guard isPending(cleanup) else { return }
         let query = cleanup.lastSeenAt.map { [URLQueryItem(name: "lastSeenAt", value: $0)] } ?? []
-        let api = self.api
+        let api = self.api, path = "/devices/\(cleanup.installationId)"
+        let user = cleanups.withLock { _ in cleanup.user }
+        guard user != nil || cleanup.deviceSecret != nil else { return finish(cleanup, confirmed: false) }
         let delete: @Sendable () async throws -> JSONValue? = {
-            // The captured token, never refreshed: an expired one is a refusal for good.
-            try await api.request(
-                "DELETE", "/devices/\(cleanup.installationId)", query: query, as: cleanup.user, refreshing: false
-            )
+            if let user {
+                // The captured token, never refreshed (the next user's callback may answer).
+                return try await api.request("DELETE", path, query: query, as: user, refreshing: false)
+            }
+            return try await api.request("DELETE", path, query: query, deviceSecret: cleanup.deviceSecret ?? "")
         }
         do {
             // Past the deadline (waiting behind a registration), it goes without one.
@@ -438,6 +519,11 @@ final class PushRegistrar: @unchecked Sendable {
             // The user registered the device again since: Kirora keeps that registration.
             log.debug("Detached the user's older registrations; a newer one is kept")
             finish(cleanup, confirmed: true)
+        } catch let error as KiroraApiError where error.status == 401 && user != nil && cleanup.deviceSecret != nil {
+            // The token expired, say: the device secret goes on from here, at once.
+            log.debug("Detaching with the device's secret: Kirora refused the user's token")
+            cleanups.withLock { _ in cleanup.user = nil }
+            await attemptInTurn(cleanup, deadline: deadline)
         } catch let error as KiroraApiError where !error.isRetryable {
             // Refused for good (e.g. the token, with no fresh one to be had). Kirora may
             // still have the device, so its record, and id, are kept.
@@ -478,9 +564,15 @@ final class PushRegistrar: @unchecked Sendable {
             state.pending[ObjectIdentifier(cleanup)] = nil
             cleanup.retry?.cancel()
         }
-        if confirmed, let record, record.detaching == true, record.userSubject == cleanup.user.subject,
+        if var record, record.detaching == true, record.userSubject == cleanup.subject,
            record.lastSeenAt == cleanup.lastSeenAt {
-            save(nil)
+            if confirmed {
+                save(nil)
+            } else if record.detachingSince != nil {
+                // Refused for good, or given up on: not resumed at the next launch either.
+                record.detachingSince = nil
+                save(record)
+            }
         }
         if !registered { onDetached() }
     }
@@ -528,7 +620,9 @@ final class PushRegistrar: @unchecked Sendable {
                 : "iOS gave no APNs token. Is the Push Notifications capability on?")
             return
         }
+        let deviceSecret = deviceId.secret()
         var body = deviceInfo.registrationDetails()
+        body["deviceSecret"] = .string(deviceSecret)
         body["pushAppId"] = .string(pushApp.pushAppId)
         body["targetKind"] = .string(pushApp.targetKind)
         body["permission"] = .string("granted")
@@ -539,7 +633,8 @@ final class PushRegistrar: @unchecked Sendable {
         save(PushRegistrationRecord(
             userSubject: user.subject, config: config, token: token, targetKind: pushApp.targetKind,
             pushAppId: pushApp.pushAppId, permission: "granted",
-            lastSeenAt: answer?["lastSeenAt"]?.stringValue, at: epochMs(now()), installationId: installationId
+            lastSeenAt: answer?["lastSeenAt"]?.stringValue, at: epochMs(now()), installationId: installationId,
+            deviceSecret: deviceSecret
         ))
         log.debug("Registered this device for push")
     }
@@ -556,7 +651,9 @@ final class PushRegistrar: @unchecked Sendable {
     /// pushes.
     private func reportDenied(as user: SignedInUser) async throws {
         guard var record, record.userSubject != user.subject || record.permission == "granted" else { return }
+        let deviceSecret = deviceId.secret()
         var body = deviceInfo.registrationDetails()
+        body["deviceSecret"] = .string(deviceSecret)
         body["pushAppId"] = .string(record.pushAppId)
         body["permission"] = .string("denied")
         body["lastSeenAt"] = .string(record.lastSeenAt ?? isoTimestamp(Date(timeIntervalSince1970: Double(record.at) / 1000)))
@@ -571,9 +668,11 @@ final class PushRegistrar: @unchecked Sendable {
             // registered in this push app, so there's nothing to turn off.
             log.debug("Denial not reported: Kirora answered \(error.status)")
         }
+        record.deviceSecret = deviceSecret
         record.userSubject = user.subject
         record.permission = "denied"
         record.detaching = nil
+        record.detachingSince = nil
         record.at = epochMs(now())
         save(record)
     }

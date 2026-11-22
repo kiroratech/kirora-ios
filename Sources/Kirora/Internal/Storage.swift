@@ -38,7 +38,7 @@ extension KeyValueStore {
 /// two clients in one app never share a device id, visit or choice.
 enum StorageKeys {
     static let scoped: Set<String> = [
-        deviceId, session, trackingConsent, trackingConsentUnknown, appVersion, appOpenActivity, pushDisabled,
+        deviceId, deviceSecret, session, trackingConsent, trackingConsentUnknown, appVersion, appOpenActivity, pushDisabled,
         pushConsent,
     ]
     /// Where a scoped key is kept for `namespace`.
@@ -53,6 +53,9 @@ enum StorageKeys {
 
     /// `device.id`, also the device's installation id for push.
     static let deviceId = "device-id"
+    /// The installation's secret, sent with every push registration: it can only detach
+    /// the device, with no user token held.
+    static let deviceSecret = "device-secret"
     /// The current visit: its id and last activity.
     static let session = "session"
     /// The user's tracking consent answer.

@@ -105,6 +105,135 @@ struct IdentityTests {
         #expect(app.server.batches.allSatisfy { $0.token == userToken("user-1") })
     }
 
+    /// A token naming no one can't be told from another user's: discarded like one, and the
+    /// app told the token was refused.
+    @Test func aFreshTokenWithoutASubjectIsDiscarded() async throws {
+        let app = TestApp()
+        let reasons = Locked<[AuthenticationFailureReason]>([])
+        let kirora = app.start(
+            fetchUserToken: { userToken(nil) },
+            onAuthenticationFailed: { reason in reasons.withLock { $0.append(reason) } }
+        )
+        app.server.answer { _ in .error(401, "UNAUTHORIZED") }
+        try await kirora.identify(userToken("user-1"))
+        kirora.track("Order Completed")
+        await kirora.flush()
+        #expect(!app.server.batches.isEmpty)
+        #expect(app.server.batches.allSatisfy { $0.token == userToken("user-1") })
+        #expect(await eventually { reasons.current == [.refused] })
+    }
+
+    /// Nor after a sign-in whose own token named no one: two such tokens may be two users.
+    @Test func aSubjectlessSignInTakesNoSubjectlessRefresh() async throws {
+        let app = TestApp()
+        let fresh = userToken(nil, issuedAt: 1_799_999_100)
+        let kirora = app.start(fetchUserToken: { fresh })
+        app.server.answer { _ in .error(401, "UNAUTHORIZED") }
+        try await kirora.identify(userToken(nil))
+        kirora.track("Order Completed")
+        await kirora.flush()
+        #expect(!app.server.batches.isEmpty)
+        #expect(!app.server.batches.contains { $0.token == fresh })
+    }
+
+    /// The app restored its own session after a relaunch, without identify(): what's
+    /// tracked continues the signed-in user's visit and waits for a sign-in, but it's theirs.
+    /// Logging out drops it, so the next user never takes it as theirs (spec gap 27).
+    @Test func logoutDropsWaitingEventsThatContinuedASignedInVisit() async throws {
+        let app = TestApp()
+        var kirora = app.start()
+        try await kirora.identify(userToken("A"))
+        kirora.track("A's")
+        await kirora.flush()
+        kirora.destroy()
+
+        kirora = app.start()
+        kirora.track("A's, before identify")
+        await kirora.logout()
+        kirora.track("After logout")
+        try await kirora.identify(userToken("B"))
+        await kirora.flush()
+        #expect(!app.server.sentEventNames.contains("A's, before identify"))
+        // What's tracked after the sign-out is the next user's to take, as before.
+        let sentAsB = app.server.batches.filter { subjectOf($0.token ?? "") == "B" }.flatMap(\.eventNames)
+        #expect(sentAsB.contains("After logout"))
+    }
+
+    /// A visitor who never signed in keeps theirs: a logout() on a screen before sign-up
+    /// can't lose a funnel.
+    @Test func logoutKeepsAVisitorsEventsFromBeforeSignIn() async throws {
+        let app = TestApp()
+        let kirora = app.start()
+        kirora.track("Pricing Viewed")
+        await kirora.logout()
+        try await kirora.identify(userToken("B"))
+        await kirora.flush()
+        #expect(app.server.sentEventNames.contains("Pricing Viewed"))
+    }
+
+    /// Without visits, which events continued a signed-in user's can't be told: none go.
+    @Test func withoutVisitsLogoutWithNobodySignedInDropsNothing() async throws {
+        let app = TestApp()
+        var kirora = app.start(trackSessions: false)
+        try await kirora.identify(userToken("A"))
+        kirora.destroy()
+        kirora = app.start(trackSessions: false)
+        kirora.track("Before identify")
+        await kirora.logout()
+        try await kirora.identify(userToken("B"))
+        await kirora.flush()
+        #expect(app.server.sentEventNames.contains("Before identify"))
+    }
+
+    /// A sign-in still under way as logout() begins is the user signing out: it adopts the
+    /// waiting events first, so they're sent as that user, not dropped.
+    @Test func logoutLetsAPendingSignInAdoptWaitingEventsFirst() async throws {
+        let app = TestApp()
+        let kirora = app.start(fetchUserToken: {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            return userToken("A")
+        }, trackSessions: false)
+        kirora.track("Before sign-in")
+        let signIn = Task { try await kirora.identify() }
+        await settle(0.05)
+        await kirora.logout()
+        _ = try? await signIn.value
+        let sentAsA = app.server.batches.filter { subjectOf($0.token ?? "") == "A" }.flatMap(\.eventNames)
+        #expect(sentAsA.contains("Before sign-in"))
+    }
+
+    /// Logout waits for a sign-in under way, here one that never comes. What was waiting as
+    /// it began, on A's restored visit, is dropped; what's tracked during that wait is the
+    /// next user's, as anything tracked during a logout is.
+    @Test func whatIsTrackedWhileLogoutWaitsGoesToTheNextUser() async throws {
+        let app = TestApp()
+        app.logoutWait = 0.4
+        var kirora = app.start()
+        try await kirora.identify(userToken("A"))
+        kirora.track("A's")
+        await kirora.flush()
+        kirora.destroy()
+
+        kirora = app.start(fetchUserToken: {
+            try await Task.sleep(nanoseconds: 3_000_000_000)
+            return userToken("A")
+        })
+        let relaunched = kirora
+        relaunched.track("Before logout")
+        let signIn = Task { try? await relaunched.identify() }
+        await settle(0.05)
+        let logout = Task { await relaunched.logout() }
+        await settle(0.1)
+        kirora.track("During logout")
+        await logout.value
+        signIn.cancel()
+        try await kirora.identify(userToken("B"))
+        await kirora.flush()
+        let sentAsB = app.server.batches.filter { subjectOf($0.token ?? "") == "B" }.flatMap(\.eventNames)
+        #expect(sentAsB.contains("During logout"))
+        #expect(!app.server.sentEventNames.contains("Before logout"))
+    }
+
     @Test func theLatestIdentifyWins() async throws {
         let app = TestApp()
         let asked = Locked(false)
@@ -236,21 +365,43 @@ struct LogoutTests {
         #expect(calls.current == 0)
     }
 
-    /// No request may follow to report it: an expired token that can't be refreshed is told
-    /// to the app by itself, once.
+    /// No request may follow to report it: a token that expired while the app was away and
+    /// can't be refreshed is told to the app by itself, once.
     @Test func anExpiredTokenThatCantBeRefreshedIsFetchFailed() async throws {
-                let app = TestApp()
+        let app = TestApp()
         let reasons = Locked<[AuthenticationFailureReason]>([])
         let kirora = app.start(
             fetchUserToken: { throw TokenServerDown() },
             onAuthenticationFailed: { reason in reasons.withLock { $0.append(reason) } }, trackSessions: false
         )
-        // Expired 400 seconds before the clock's now.
-        try await kirora.identify(userToken("user-1", issuedAt: 1_799_996_000))
+        try await kirora.identify(userToken("user-1", issuedAt: 1_800_000_000))
+        app.lifecycle.fire(.background)
+        app.clock.advance(4000)
+        app.lifecycle.fire(.foreground)
         #expect(await eventually { reasons.current == [.fetchFailed] })
         app.lifecycle.fire(.foreground)
         await settle()
         #expect(reasons.current == [.fetchFailed])
+    }
+
+    /// A device whose clock is ahead: every token looks expired as it arrives. Its lifetime
+    /// counts from now, so it's used, not fetched again at once, and refreshed ahead.
+    @Test func aTokenExpiredOnArrivalHasItsLifetimeCountedFromNow() async throws {
+        let app = TestApp()
+        let calls = Locked(0)
+        let kirora = app.start(
+            fetchUserToken: { calls.withLock { $0 += 1 }; return userToken("user-1", issuedAt: 1_799_990_000, expiresIn: 7200) },
+            trackSessions: false
+        )
+        // Issued, by the device's clock, 10,000 seconds ago, lasting 61.
+        let token = userToken("user-1", issuedAt: 1_799_990_000, expiresIn: 61)
+        try await kirora.identify(token)
+        kirora.track("One")
+        await kirora.flush()
+        #expect(app.server.batches.last?.token == token)
+        #expect(calls.current == 0)
+        // Refreshed about a second on, 60 seconds before its counted end.
+        #expect(await eventually(3) { calls.current == 1 })
     }
 
     @Test func aRefreshAheadOfExpiryThatFailsIsNotReportedYet() async throws {
@@ -268,8 +419,39 @@ struct LogoutTests {
         #expect(reasons.current.isEmpty)
     }
 
+    /// A device whose clock is behind: the token's lifetime counts from now, so its refresh
+    /// still comes 60 seconds before it runs out, not an hour late.
+    @Test func aTokenIssuedAheadOfTheClockIsRefreshedOnTimeByIt() async throws {
+        let app = TestApp()
+        let calls = Locked(0)
+        let kirora = app.start(
+            fetchUserToken: { calls.withLock { $0 += 1 }; return userToken("user-1", issuedAt: 1_800_003_600, expiresIn: 7200) },
+            trackSessions: false
+        )
+        // Issued an hour ahead of the clock, lasting 61 seconds: refreshed in about a second.
+        try await kirora.identify(userToken("user-1", issuedAt: 1_800_003_600, expiresIn: 61))
+        #expect(await eventually(3) { calls.current == 1 })
+    }
+
+    @Test func countsTheLifetimeOfATokenIssuedAheadOfTheClockFromNow() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let ahead = claimsOf(userToken("u", issuedAt: 1_800_003_600, expiresIn: 600))
+        #expect(expiryOf(ahead, now: now) == now.addingTimeInterval(600))
+        // Up to the 60-second lead is ordinary skew: `exp` as it is.
+        let slightly = claimsOf(userToken("u", issuedAt: 1_800_000_060, expiresIn: 600))
+        #expect(expiryOf(slightly, now: now) == Date(timeIntervalSince1970: 1_800_000_660))
+        // Already expired as it arrives: from now too.
+        let expired = claimsOf(userToken("u", issuedAt: 1_799_990_000, expiresIn: 600))
+        #expect(expiryOf(expired, now: now) == now.addingTimeInterval(600))
+        // Expired, with no `iat` to tell its lifetime: not known, so it waits for a refusal.
+        #expect(expiryOf(TokenClaims(subject: "u", expiry: now.addingTimeInterval(-10)), now: now) == nil)
+        // No `iat`: `exp` as it is.
+        let undated = TokenClaims(subject: "u", expiry: Date(timeIntervalSince1970: 1_800_009_000))
+        #expect(expiryOf(undated, now: now) == undated.expiry)
+    }
+
     @Test func readsTheTokensExpiry() {
-        #expect(SignedInUser(token: userToken("u", issuedAt: 1_800_000_000, expiresIn: 60)).tokenAndExpiry.expiry
+        #expect(SignedInUser(token: userToken("u", issuedAt: 1_800_000_000, expiresIn: 60), now: Date(timeIntervalSince1970: 1_800_000_000)).tokenAndExpiry.expiry
             == Date(timeIntervalSince1970: 1_800_000_060))
         #expect(SignedInUser(token: "not.a.token").tokenAndExpiry.expiry == nil)
         #expect(SignedInUser(token: "").tokenAndExpiry.expiry == nil)

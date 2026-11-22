@@ -18,6 +18,18 @@ struct QueuedEvent: Codable, Sendable, Equatable {
 private struct StoredEvent: Codable, Sendable {
     var owner: String?
     var event: QueuedEvent
+    /// For an event from before sign-in that continued a user's visit (after a relaunch,
+    /// say), whose visit it was. Kept after adoption, so one given back is checked again.
+    var sessionOwner: String?
+
+    /// Owned by `owner` from now on. Leaves another user's visit: two users' visits are
+    /// never joined.
+    func adopted(by owner: String) -> StoredEvent {
+        var entry = self
+        entry.owner = owner
+        if let sessionOwner, sessionOwner != owner { entry.event.context["sessionId"] = nil }
+        return entry
+    }
 }
 
 /// Past this many, the oldest events are dropped (e.g. after a long time offline).
@@ -66,6 +78,14 @@ final class EventQueue: @unchecked Sendable {
             stored[index].owner = owner
             sizes[index] += change
             bytes += change
+        }
+
+        /// Puts `entry` in place of entry `index`, measuring it again.
+        mutating func replace(at index: Int, with entry: StoredEvent) {
+            let size = encodedSize(entry)
+            stored[index] = entry
+            bytes += size - sizes[index]
+            sizes[index] = size
         }
 
         mutating func append(_ entry: StoredEvent, size: Int) {
@@ -129,8 +149,11 @@ final class EventQueue: @unchecked Sendable {
     /// Never waits for the file: before it's read, the read writes what was added meanwhile
     /// together with what it read, so the file never holds less than it did.
     @discardableResult
-    func add(_ event: QueuedEvent, owner: String?) -> Int {
-        let entry = StoredEvent(owner: owner, event: event)
+    /// `sessionOwner`: for one tracked before sign-in, whose visit it continued; one given
+    /// straight to a user who has signed in since (after `beforeSend`) is adopted by them.
+    func add(_ event: QueuedEvent, owner: String?, sessionOwner: String? = nil) -> Int {
+        let unowned = StoredEvent(owner: nil, event: event, sessionOwner: sessionOwner)
+        let entry = owner.map { unowned.adopted(by: $0) } ?? unowned
         let size = encodedSize(entry)
         guard fileBytes(size, 1) <= maxQueuedBytes else {
             log.error("\(event.name) not tracked: larger than the \(maxQueuedBytes)-byte queue")
@@ -169,8 +192,13 @@ final class EventQueue: @unchecked Sendable {
             var adopted = Set<String>()
             let change = ownerBytes(owner)
             for index in state.stored.indices where state.stored[index].owner == nil {
-                state.setOwner(owner, at: index, sizeChange: change)
-                adopted.insert(state.stored[index].event.idempotencyKey)
+                let entry = state.stored[index]
+                if let sessionOwner = entry.sessionOwner, sessionOwner != owner {
+                    state.replace(at: index, with: entry.adopted(by: owner))
+                } else {
+                    state.setOwner(owner, at: index, sizeChange: change)
+                }
+                adopted.insert(entry.event.idempotencyKey)
             }
             if !adopted.isEmpty {
                 state.trim()
@@ -224,6 +252,25 @@ final class EventQueue: @unchecked Sendable {
             guard let owner = stored.owner else { return true }
             return !test(owner, stored.event)
         }
+    }
+
+    /// The keys of the events waiting for a sign-in now, and of those that continued a
+    /// signed-in user's visit.
+    func waitingKeys() -> (all: Set<String>, onSignedInVisits: Set<String>) {
+        loadIfNeeded()
+        return state.withLock { state in
+            let waiting = state.stored.filter { $0.owner == nil }
+            return (
+                Set(waiting.map(\.event.idempotencyKey)),
+                Set(waiting.filter { $0.sessionOwner != nil }.map(\.event.idempotencyKey))
+            )
+        }
+    }
+
+    /// Drops those of `keys` still waiting for a sign-in.
+    func clearWaiting(_ keys: Set<String>) {
+        guard !keys.isEmpty else { return }
+        keep { $0.owner != nil || !keys.contains($0.event.idempotencyKey) }
     }
 
     func clearAll() {

@@ -147,13 +147,29 @@ final class ClientAPI: Sendable {
     /// One call; Kirora's answer to it is `user`'s token accepted. A 401 is thrown like any
     /// other refusal, with Kirora's own code and message.
     private func send(_ template: URLRequest, token: String, as user: SignedInUser) async throws -> JSONValue? {
+        let answer = try await send(template, authorization: "Bearer \(token)")
+        user.confirm()
+        return answer
+    }
+
+    /// A call made with the device's secret (`Authorization: Device`), for detaching a
+    /// registration with no user token held: no user, so no refresh.
+    @discardableResult
+    func request(
+        _ method: String, _ path: String, query: [URLQueryItem] = [], deviceSecret: String
+    ) async throws -> JSONValue? {
+        guard let baseURL else { throw KiroraError(urlProblem ?? "apiUrl is not an address") }
+        let request = try makeRequest(baseURL, method, path, query, nil)
+        return try await send(request, authorization: "Device \(deviceSecret)")
+    }
+
+    private func send(_ template: URLRequest, authorization: String) async throws -> JSONValue? {
         var request = template
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue(authorization, forHTTPHeaderField: "Authorization")
         let (data, response) = try await transport.send(request)
         guard (200..<300).contains(response.statusCode) else {
             throw apiError(response, data)
         }
-        user.confirm()
         if response.statusCode == 204 || data.isEmpty { return nil }
         return (try? JSONDecoder().decode(JSONValue.self, from: data))?["data"]
     }

@@ -2,11 +2,28 @@
 
 ## Unreleased
 
+- Fix: signing out after a relaunch, before `identify()`, left the device registered to the
+  user, so their pushes kept arriving. The SDK now makes a device secret once per
+  installation (32 random bytes, kept with the device id) and sends it with every push
+  registration; it can only detach the device. `logout()` with nobody signed in detaches
+  by it, as does a detachment whose user token Kirora refused. A detachment still
+  pending as the app ends continues at the next launch, within 24 hours of the sign-out.
+  `setPushEnabled(false)` with nobody signed in detaches the same way.
+- Fix: events tracked before `identify()` by an app that restored its own session after a
+  relaunch were taken by the next user to sign in. `logout()` now drops the waiting events
+  the signing-out user made: with a user signed in, all those waiting as it began; with
+  nobody signed in, those that continued a signed-in user's visit. A visitor who never
+  signed in keeps theirs. Call `identify()` at every launch while the app is signed in,
+  and `logout()` only from the app's sign-out.
 - Fix: signing out could leave the device registered to the user, so their pushes kept
   arriving. The device's id was dropped when tracking was refused during a registration,
   and signing out then detached a different id. A registration now keeps the id it was
   made with, and a detachment still waiting is retried as the app goes to the background
   (with time from iOS) and comes back.
+- Fix: after a relaunch, events tracked before sign-in joined the previous user's visit,
+  and kept its `sessionId` when a different user signed in and took them. They're now
+  sent without one, as the spec and web do; the same user signing in again keeps them in
+  their visit.
 - Fix: two threads making the device id at once on a fresh install could make two.
 - Fix: an event tracked at the instant of sign-in could be left for the next user to send.
 - Fix: after the device slept, new events could wait for an older retry timer instead of
@@ -25,6 +42,14 @@
   returned no token"), a background refresh tells `onAuthenticationFailed` `.fetchFailed`
   once the token has expired, and nothing is sent with an empty token. A wrapper's
   `TokenRequests.answer(_:token:)` takes `nil` the same way.
+- A refreshed token without `sub` is refused, as one naming another user is: it can't be
+  told from another user's. `onAuthenticationFailed` hears `.refused`.
+- A device clock that's off no longer costs a refused request per token. A token already
+  expired as it arrives, or whose `iat` is more than 60 seconds ahead of the device's
+  clock, has its lifetime (`exp` less `iat`) counted from now, so it's refreshed 60 seconds
+  before it runs out, as on any device. Before, an expired-looking token was fetched again
+  at once at sign-in, and later ones were replaced only after Kirora refused them. A stale
+  token passed to `identify()` is now replaced once Kirora refuses it.
 - A `422` is split per event only when its `errors` name a body field under `events`, as a
   `400` is. One naming no event (a proxy answering `422` to everything, a wrong `apiUrl`)
   keeps the events and backs off, instead of dropping the queue one event at a time.

@@ -29,6 +29,7 @@ struct PushRegistrationTests {
             "permission": .string("granted"), "target": .string("abcd01"),
             "appVersion": .string("2.4.0"), "osVersion": .string("17.4.1"),
             "locale": .string("en-GB"), "timezone": .string("Africa/Lagos"),
+            "deviceSecret": .string(app.stored(StorageKeys.deviceSecret) ?? ""),
         ]))
     }
 

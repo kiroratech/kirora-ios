@@ -189,4 +189,75 @@ struct ConsentTests {
         #expect(app.server.batches.isEmpty)
         #expect(app.stored(StorageKeys.deviceId) == nil)
     }
+
+    /// After a relaunch, events from before sign-in continue the last visit, A's. If B signs
+    /// in and adopts them, they leave A's visit: two users' visits are never joined.
+    @Test func anotherUserAdoptingEventsFromBeforeSignInTakesThemOutOfTheLastUsersVisit() async throws {
+        let app = TestApp()
+        var kirora = app.start()
+        try await kirora.identify(userToken("A"))
+        kirora.track("A's")
+        await kirora.flush()
+        let aSession = try #require(app.server.batches.flatMap(\.events).first?["context"]?["sessionId"]?.stringValue)
+
+        // Relaunched: nobody is signed in yet, and A's visit is still live.
+        kirora = app.start()
+        kirora.track("Before sign-in")
+        try await kirora.identify(userToken("B"))
+        kirora.track("B's")
+        await kirora.flush()
+        let bEvents = app.server.batches.filter { subjectOf($0.token ?? "") == "B" }.flatMap(\.events)
+        let before = try #require(bEvents.first { $0["name"]?.stringValue == "Before sign-in" })
+        #expect(before["context"]?["sessionId"] == nil)
+        #expect(bEvents.allSatisfy { $0["context"]?["sessionId"]?.stringValue != aSession })
+    }
+
+    /// The same user signing in again keeps them in their visit.
+    @Test func theSameUserAdoptingEventsFromBeforeSignInKeepsTheirVisit() async throws {
+        let app = TestApp()
+        var kirora = app.start()
+        try await kirora.identify(userToken("A"))
+        kirora.track("A's")
+        await kirora.flush()
+        let aSession = try #require(app.server.batches.flatMap(\.events).first?["context"]?["sessionId"]?.stringValue)
+
+        kirora = app.start()
+        kirora.track("Before sign-in")
+        try await kirora.identify(userToken("A"))
+        await kirora.flush()
+        let before = try #require(app.server.batches.flatMap(\.events).first { $0["name"]?.stringValue == "Before sign-in" })
+        #expect(before["context"]?["sessionId"]?.stringValue == aSession)
+    }
+
+    /// As with a `beforeSend`, whose events are queued once it returns: a sign-in meanwhile
+    /// adopts them straight away, and the same rule applies.
+    @Test func anEventHeldByBeforeSendLeavesTheLastUsersVisitToo() async throws {
+        let app = TestApp()
+        var kirora = app.start()
+        try await kirora.identify(userToken("A"))
+        kirora.track("A's")
+        await kirora.flush()
+        let aSession = try #require(app.server.batches.flatMap(\.events).first?["context"]?["sessionId"]?.stringValue)
+
+        let signedIn = DispatchSemaphore(value: 0)
+        let inHook = Locked(false)
+        let relaunched = app.start(beforeSend: { event in
+            if event.name == "Before sign-in" {
+                inHook.withLock { $0 = true }
+                signedIn.wait()
+            }
+            return event
+        })
+        kirora = relaunched
+        let tracking = Task.detached { relaunched.track("Before sign-in") }
+        #expect(await eventually { inHook.current })
+        try await kirora.identify(userToken("B"))
+        signedIn.signal()
+        await tracking.value
+        await kirora.flush()
+        let bEvents = app.server.batches.filter { subjectOf($0.token ?? "") == "B" }.flatMap(\.events)
+        let before = try #require(bEvents.first { $0["name"]?.stringValue == "Before sign-in" })
+        #expect(before["context"]?["sessionId"] == nil)
+        #expect(bEvents.allSatisfy { $0["context"]?["sessionId"]?.stringValue != aSession })
+    }
 }
