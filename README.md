@@ -1,10 +1,10 @@
 # Kirora iOS SDK
 
-Connect customer activity in your iOS app to Kirora. Track events for signed-in users, automate follow-ups and register devices for push notifications.
+Connect your iOS app's signed-in users to their Kirora contacts. Track their events for segments, journeys, goals and campaigns, and register their devices for push notifications.
 
 The SDK provides a bounded offline event queue, session tracking, separate consent controls and an optional notification service extension for delivery reports and images. It has no third-party package dependencies. FirebaseMessaging is optional and supplied by your app when you send through Firebase.
 
-[Quickstart](#quickstart) · [Events and sessions](#events-and-sessions) · [Consent](#consent) · [Push notifications](#push-notifications) · [API reference](#api-reference) · [Troubleshooting](#troubleshooting)
+[Quickstart](#quickstart) · [How Kirora uses this data](#how-kirora-uses-this-data) · [Events and sessions](#events-and-sessions) · [Consent](#consent) · [Push notifications](#push-notifications) · [API reference](#api-reference) · [Troubleshooting](#troubleshooting)
 
 ## Installation
 
@@ -53,10 +53,10 @@ For React Native or Flutter, use the corresponding Kirora wrapper. Native bridge
 
 ### 1. Get your workspace credentials
 
-Open **Developer → SDK** in Kirora:
+Open **Developer → SDK** in Kirora. An admin or the owner chooses **Set up the SDK**:
 
-- **Client key** (`kirora_pk_…`): public; include it in your app.
-- **Token secret**: private; keep it on your server.
+- **Public key**: the client key (`kirora_pk_…`). Public; include it in your app.
+- **Secret key**: the SDK token secret, shown once. Private; keep it on your server, for example as `KIRORA_SDK_TOKEN_SECRET`.
 
 Never include the token secret or a server API key in the app, notification extension, source-controlled configuration or logs.
 
@@ -64,7 +64,7 @@ Never include the token secret or a server API key in the app, notification exte
 
 Create an authenticated endpoint that signs a token for the current session user. Derive the user ID from your server's authenticated session, rather than accepting a user ID supplied by the app.
 
-A token is an HS256 JWT signed with the workspace's SDK token secret. It needs a string `sub`, an `iat` timestamp and an `exp` no more than 24 hours after `iat`. A one-hour lifetime is a useful starting point.
+A token is an HS256 JWT signed with the workspace's SDK token secret. It needs a string `sub`, an `iat` timestamp and an `exp` no more than 24 hours after `iat`. A one-hour lifetime is a useful starting point. `sub` is the contact's `externalId` in Kirora: use the same ID your server uses for that person in Kirora's API. A user Kirora doesn't know yet becomes a contact, with only that `externalId`, on their first request.
 
 With the Kirora Node.js library:
 
@@ -135,7 +135,7 @@ The example requires opt-in. Call this from your consent flow after the user ans
 AppServices.kirora.setTrackingConsent(true) // The user granted behavioural tracking.
 ```
 
-Pass `false` when the user refuses or withdraws consent. Do not automatically grant consent to make an integration check pass. If your app does not require prior opt-in, the option defaults to `false`; a remembered refusal still takes precedence.
+Pass `false` when the user refuses or withdraws consent. Do not automatically grant consent to make an integration check pass. Without `requireTrackingConsent` (it defaults to `false`), tracking is allowed until your app calls `setTrackingConsent(false)`; a remembered refusal still takes precedence.
 
 ### 5. Identify and track
 
@@ -161,6 +161,17 @@ Task {
 
 Check the event in Kirora. A returned `flush()` means the attempt finished, not that every event was accepted.
 
+## How Kirora uses this data
+
+The person signed in to your app is a **contact** in Kirora, matched by the token's `sub` (the contact's `externalId`). Every event the SDK sends belongs to that contact, and Kirora uses it as it uses events your server tracks through the API:
+
+- **Segments** can select contacts by an event, how often and how recently it happened, with property filters, for example everyone with an `Order Completed` whose `total` is over 50 in the last 30 days. Push reachability conditions also use the device's language, app version and OS version, which the SDK sends when it registers for push.
+- **Journeys** can start when an event happens, filter entry on its properties, and exit on another event. An event that reaches Kirora more than 72 hours after it happened doesn't start a journey: an event kept offline that long still counts for segments and goals.
+- **Goals** are measured from your own events (Starter plan and above).
+- **Campaigns** send to a list, a segment or rules; a push campaign names the push app.
+
+The SDK doesn't set contact attributes (name, email, plan): set those from your server through Kirora's API. It tracks nothing anonymously: events from before sign-in wait on the device and are sent as the next user to sign in (see [Identity and logout](#identity-and-logout)). Kirora has no anonymous contacts to merge later.
+
 ## Identity and logout
 
 ```swift
@@ -168,7 +179,7 @@ try await kirora.identify()      // Uses fetchUserToken.
 try await kirora.identify(token) // Uses a token you already obtained.
 ```
 
-The SDK sends no anonymous behavioural requests. Events tracked before identification, while tracking is allowed, wait on the device for the next user. Once adopted, they retain that user's identity across retries and restarts. Events captured while A is signed in never become B's events. If a never-accepted token is refused, its adopted pre-sign-in events can be released for a later sign-in.
+The SDK sends no anonymous requests. Events tracked before identification, while tracking is allowed, wait on the device for the next user. Once adopted, they retain that user's identity across retries and restarts. Events captured while A is signed in never become B's events. If a never-accepted token is refused, its adopted pre-sign-in events can be released for a later sign-in.
 
 With `fetchUserToken`, the SDK asks for a fresh token 60 seconds before the current one's `exp`, when the app returns to the foreground after it has expired, and once when a request receives `401`. A replacement must name the same user. Tokens stay in memory; they are not written into queued events.
 
@@ -192,7 +203,7 @@ await kirora.logout()
 
 Logout attempts event delivery and device detachment within a total five-second deadline, including an identification already in progress. It then clears the selected user and their remaining behavioural events. Activity captured during logout waits for the next user.
 
-Failed device detachment is retried in memory using the outgoing identity, with backoff, for up to 24 hours. The request names the last successful registration's `lastSeenAt`, so a late detach cannot undo a newer registration when the server implements that contract. Ensure the deployed API supports it.
+Failed device detachment is retried in memory using the outgoing identity, with backoff, for up to 24 hours, and at once when the app goes to the background (with background time from iOS) and returns to the foreground. The request names the last successful registration's `lastSeenAt`, so a late detach cannot undo a newer registration when the server implements that contract. Ensure the deployed API supports it.
 
 **Offline logout is not immediate server-side revocation.** Cleanup retries end when the app process ends or the client is destroyed. A request already accepted by Kirora cannot be recalled. Cleanup uses the outgoing user's token as captured and never asks `fetchUserToken` for a fresh one: a `401` ends it.
 
@@ -203,7 +214,15 @@ kirora.track("Lesson Completed", properties: ["lesson_id": "lesson-12"])
 kirora.trackScreenView("Checkout")
 ```
 
-Screens are tracked explicitly. Names are case-sensitive; use stable names that match your segments, journeys and goals. Put variable details in properties rather than event names. Names beginning with `contact.` are reserved by Kirora.
+`trackScreenView` tracks `Screen Viewed` with the screen's name as its `name` property. Screens are tracked explicitly; nothing is detected automatically.
+
+Names are case-sensitive; use stable names that match your segments, journeys and goals. Kirora's conventions:
+
+- Event names in Title Case, object then past-tense action (`Order Completed`), up to 128 characters, at most 1,000 distinct names per workspace. Put variable details in properties rather than event names.
+- Property names in lowercase `snake_case`, up to 64 characters; the whole `properties` object at most 16 KB.
+- Names beginning with `contact.` are Kirora's own.
+
+The SDK doesn't check these: Kirora refuses an event that breaks them (`VALIDATION_ERROR`), and the SDK drops that event, logs it and sends the rest.
 
 Properties are copied synchronously at capture. Use JSON-compatible strings, finite numbers, booleans, `NSNull`, arrays and string-keyed dictionaries. Dates become ISO 8601 strings; URLs and UUIDs become strings. An absent optional dictionary member is omitted; use `NSNull()` for an explicit null. An unsupported value drops the event and produces a diagnostic rather than throwing into your app.
 
@@ -228,7 +247,7 @@ The synchronous hook runs once for each behavioural event, including automatic e
 
 ### Sessions and lifecycle events
 
-Sessions are enabled by default. A new visit emits `Session Started`; events carry `context.sessionId`. Activity and foreground time keep the visit alive. After 30 minutes of inactivity, the next activity starts a new visit. A relaunch can continue the stored visit; changing users starts a different user's visit. Set `trackSessions: false` to disable session events and IDs.
+Sessions (visits) are enabled by default. A new visit emits `Session Started`; events carry `context.sessionId`. Activity and foreground time keep the visit alive. After 30 minutes of inactivity, the next activity starts a new visit. A relaunch can continue the stored visit; changing users starts a different user's visit. Set `trackSessions: false` to disable session events and IDs.
 
 With `trackAppLifecycle: true`, the SDK also records `Application Installed`, `Application Updated`, `Application Opened` and `Application Backgrounded`. Lifecycle tracking is off by default and subject to behavioural tracking consent.
 
@@ -251,7 +270,7 @@ These controls have different purposes:
 | --- | --- | --- |
 | `setTrackingConsent(_:)` | Device/workspace tracking preference | Controls behavioural events, sessions and influenced app-open reports |
 | `requestPushPermission()` | iOS notification authorisation | Asks the OS whether notifications may be shown |
-| `setPushEnabled(_:)` | Device/workspace preference | Enables or detaches this installation; survives logout |
+| `setPushEnabled(_:)` | Device/workspace preference | Registers or detaches this device; survives logout |
 | `setPushConsent(_:)` | Signed-in user's marketing choice | Records marketing push consent with Kirora |
 
 Withdrawing tracking clears queued behavioural events and influenced app opens, ends the session and cancels further behavioural delivery where possible. A push device ID may remain while registration or cleanup needs it. Previously accepted server data is not recalled.
@@ -364,7 +383,7 @@ final class NotificationService: KiroraNotificationServiceExtension {}
 
 Keep the generated extension configuration and principal-class entry. Set a compatible deployment target. Kirora supplies `mutable-content: 1`; custom payloads must also satisfy Apple's notification-extension requirements.
 
-The helper attempts a delivery report, downloads an HTTPS image and registers the push's buttons before finishing. It needs neither a client key nor an App Group: reporting credentials are carried by the notification's `trackingUrl`. The report retries once on network errors, `429` or `5xx`, then is dropped. Reports are best effort and are not recovered through shared App Group storage. Extension expiry hands the available content back to iOS.
+The helper attempts a delivery report, downloads an HTTPS image and registers the push's buttons before handing the notification to iOS. It holds the notification back for the report 5 seconds at most; the report then carries on in the background, and may be lost if iOS ends the extension first. It needs neither a client key nor an App Group: reporting credentials are carried by the notification's `trackingUrl`. The report retries once on network errors, `429` or `5xx`, then is dropped. Reports are best effort and are not recovered through shared App Group storage. Extension expiry hands the available content back to iOS.
 
 For an existing extension, call `KiroraNotificationService.didReceive(_:withContentHandler:)`. If it returns `false`, handle that notification yourself and call its content handler. Forward `serviceExtensionTimeWillExpire()` to Kirora too, as `KiroraNotificationService.serviceExtensionTimeWillExpire(for: request)` with the request your extension was given, so only that push is cut short. Keep other providers' extension processing intact.
 
@@ -416,21 +435,28 @@ Without the extension, iOS delivered reports, Kirora image attachments and butto
 SDK errors use the `KiroraError` base class:
 
 - `KiroraApiError`: API status, optional error `code` and `retryAfterMs`.
-- `UserTokenError`: token callback failure/timeout, with `underlying` cause.
+- `UserTokenError`: `fetchUserToken` threw, returned no token, or timed out; `underlying` is the cause when it threw or timed out.
 - `KiroraError`: setup or network failure, with a message and optional underlying error.
 
 Task cancellation can surface separately as `CancellationError`. Event tracking does not throw; rejected events are logged. Logging uses subsystem `io.kirora.sdk`; debug output includes event names and delivery counts. Keep sensitive values out of event names and token-callback errors.
 
 ## Privacy and local storage
 
-The SDK uses no IDFA, IDFV, Keychain or device model. It does not request App Tracking Transparency permission. Its installation ID is a random UUID in the app container, scoped to the client key and API deployment.
+To report how push notifications perform, the SDK sends:
+- the app's version, the OS version, and the device's language and time zone, when it registers the device;
+- the time the app is opened or returns to the foreground;
+- when a Kirora notification is shown or tapped.
+
+Behavioural tracking consent also controls app-open times for influenced opens. Push registration details, delivery receipts and notification taps are operational push reports and are separate from behavioural tracking consent and marketing push consent. Disabling behavioural tracking does not disable those operational reports.
+
+It never sends hardware or advertising identifiers. The device id is a random value the SDK creates and keeps in the app's own storage; it is deleted with the app. On iOS that means no IDFA, IDFV, Keychain or device model, and no App Tracking Transparency prompt. The device id (`context.device.id`, also the device's push installation id) is a random UUID, scoped to the client key and API deployment.
 
 Files live under `Application Support/io.kirora.sdk/`. The directory is excluded from device backups. Events and state are JSON files protected by the app's storage environment; the SDK adds no application-level encryption. Do not put credentials or unnecessary sensitive data in event properties.
 
 | Storage | Contents |
 | --- | --- |
 | `events-<hash>.json` | Bounded queued event snapshots, owners and idempotency keys |
-| `state.json` | Namespaced installation/session state, preferences, last registration, app version and pending influenced opens; APNs cache; the last `apiUrl`, for a tap that launches the app before the client exists |
+| `state.json` | Namespaced device id, visit state, preferences, last registration, app version and pending influenced opens; APNs cache; the last `apiUrl`, for a tap that launches the app before the client exists |
 | `consent.json` | Independent tracking-refusal copy |
 | Extension's `UserDefaults` | The order of Kirora's button categories, so the least recently used go first (declared in the extension's privacy manifest) |
 | Memory | User JWTs, active requests and detach retry credentials |
