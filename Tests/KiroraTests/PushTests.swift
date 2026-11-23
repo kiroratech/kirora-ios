@@ -104,6 +104,22 @@ struct PushRegistrationTests {
         try await app.start(push: .enabled).identify(userToken("user-1"))
     }
 
+    @Test func comingBackOnlineRegistersADeviceThatCouldntRegisterOffline() async throws {
+        let app = TestApp()
+        app.server.answer { $0.method == "PUT" ? .networkError : nil }
+        try await app.start(push: .enabled).identify(userToken("user-1"))
+        await settle(0.3)
+        // Every attempt so far, including the one the APNs token's arrival starts.
+        let failed = app.server.requests.filter { $0.method == "PUT" }.count
+        app.server.answer { _ in nil }
+        app.lifecycle.fire(.online)
+        #expect(await eventually { app.server.requests.filter { $0.method == "PUT" }.count == failed + 1 })
+        // Once registered, coming back online again registers nothing.
+        app.lifecycle.fire(.online)
+        await settle()
+        #expect(app.server.requests.filter { $0.method == "PUT" }.count == failed + 1)
+    }
+
     @Test func reportsNotificationsTurnedOffInSettings() async throws {
         let app = TestApp()
         let kirora = app.start(push: .enabled)

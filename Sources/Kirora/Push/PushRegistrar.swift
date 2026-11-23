@@ -334,9 +334,9 @@ final class PushRegistrar: @unchecked Sendable {
 
     private var isDisabled: Bool { store.string(StorageKeys.pushDisabled) != nil }
 
-    /// As ``register()``, in the background, logging a failure: for a new token, or the app
+    /// As ``register()``, in the background, logging a failure: for a new token, the app
     /// coming back to the foreground (notifications turned off in Settings, a day-old
-    /// registration).
+    /// registration), or the network coming back (a registration that failed offline).
     func registerInBackground() {
         guard identity.sendingUser != nil, enabled else { return }
         let log = self.log

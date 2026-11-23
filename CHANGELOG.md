@@ -8,6 +8,9 @@
 - Push: when the SDK adds the APNs token callbacks to an app delegate that lacks them,
   it sets the delegate again, so UIKit sees them (as Firebase does). Before, such an app
   could get no token and never register.
+- Push: coming back online registers a device whose registration failed offline (no
+  APNs or Firebase token yet, or no answer from Kirora). Before, it waited until the app
+  next came to the foreground.
 - Push: an app in Firebase's installation-ID mode (FirebaseMessaging 12.16+,
   `FirebaseMessagingInstallationIdEnabled` = `YES`), which has no FCM token, registers its
   Firebase installation ID (`targetKind: "firebase_installation_id"`). Before, it never

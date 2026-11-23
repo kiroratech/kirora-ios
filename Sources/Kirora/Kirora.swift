@@ -490,6 +490,8 @@ public final class Kirora: @unchecked Sendable {
             appOpens.touchVisit()
         case .online:
             Task { await self.flush() }
+            // Retries a push registration that failed offline.
+            push.registerInBackground()
         }
     }
 
