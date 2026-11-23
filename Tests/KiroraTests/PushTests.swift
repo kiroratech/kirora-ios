@@ -179,11 +179,13 @@ struct PushRegistrationTests {
 
     @Test func logoutWaitsAtMostItsLimitThenForgetsTheUser() async throws {
         let app = TestApp()
-        // Room for the detach to start before the deadline on a busy machine: one that starts
-        // after it goes without one, and isn't what this checks.
         app.logoutWait = 0.6
         let kirora = app.start(push: .enabled)
         try await kirora.identify(userToken("user-1"))
+        // The detachment waits behind the sign-in's registration, and one that starts past the
+        // deadline goes without one, which isn't what this checks: let the registration end.
+        #expect(await eventually { app.server.completedRequests.contains { $0.method == "PUT" } })
+        await settle()
         app.server.answer { $0.method == "DELETE" ? FakeAnswer(status: 204, body: nil, delay: 3) : nil }
         let started = Date()
         await kirora.logout()
@@ -196,7 +198,7 @@ struct PushRegistrationTests {
         #expect(!app.server.sentEventNames.contains("After Logout"))
         // The request still under way at the deadline was cancelled, and the detachment
         // carries on in the background.
-        #expect(await eventually(5) { app.server.requests.filter { $0.method == "DELETE" }.count >= 2 })
+        #expect(await eventually { app.server.requests.filter { $0.method == "DELETE" }.count >= 2 })
     }
 
     @Test func logoutCancelsASendStillUnderWayAtItsDeadline() async throws {

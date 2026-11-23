@@ -546,8 +546,10 @@ struct LogoutTests {
         let kirora = app.start(fetchUserToken: { calls.withLock { $0 += 1 }; return userToken("user-1") })
         try await kirora.identify(userToken("user-1", issuedAt: 1_800_000_000, expiresIn: 61))
         await kirora.logout()
+        // Due a second after the sign-in: on a slow machine, before the logout ends.
+        let beforeSignOut = calls.current
         await settle(1.5)
-        #expect(calls.current == 0)
+        #expect(calls.current == beforeSignOut)
     }
 
     /// No request may follow to report it: a token that expired while the app was away and

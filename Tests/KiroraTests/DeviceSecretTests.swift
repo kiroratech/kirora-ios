@@ -70,7 +70,8 @@ struct DeviceSecretTests {
 
         offline.withLock { $0 = false }
         kirora = app.start(push: .enabled)
-        #expect(await eventually { deletes(app).contains { $0.headers["Authorization"] == "Device \(secret)" } })
+        // Room for a busy machine: the resumed detachment starts behind the new client's setup.
+        #expect(await eventually(5) { deletes(app).contains { $0.headers["Authorization"] == "Device \(secret)" } })
         #expect(await eventually { kirora.push.pendingDetachments == 0 && !kirora.push.registered })
     }
 

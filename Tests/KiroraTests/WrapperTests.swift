@@ -222,12 +222,13 @@ struct WrapperCallbackTests {
         KiroraWrapper.setDeepLinkHandler { _ in true }
         #expect(await wrapperOpenedLink(url))
         KiroraWrapper.setDeepLinkHandler { _ in
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
             return true
         }
         let started = Date()
         #expect(await wrapperOpenedLink(url, timeout: 0.1) == false)
-        #expect(Date().timeIntervalSince(started) < 1)
+        // Well short of the 10-second answer, with room for a slow CI machine.
+        #expect(Date().timeIntervalSince(started) < 5)
     }
 
     @Test func aForegroundAnswerDefaultsToShowing() async {
