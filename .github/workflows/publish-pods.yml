@@ -1,0 +1,61 @@
+# Publishes a release's pods to CocoaPods trunk. Started by hand only (Actions → Publish
+# pods → Run workflow), for a tag that already exists: it never runs on a push or a tag,
+# and creates no tag or GitHub release. Runs here because `pod trunk push` builds each pod
+# for iOS, which needs Xcode.
+#
+# Needs the `COCOAPODS_TRUNK_TOKEN` secret: the session token of a trunk owner of both
+# pods (`pod trunk register`, then the password for trunk.cocoapods.org in ~/.netrc).
+name: Publish pods
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, such as 0.1.0
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pods
+
+jobs:
+  publish:
+    name: Publish to CocoaPods trunk
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check the tag
+        run: |
+          if ! [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$TAG isn't a release tag such as 0.1.0"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      - name: Check the podspecs are at the tag's version
+        run: |
+          for spec in KiroraNotificationService Kirora; do
+            grep -q "s.version          = '$TAG'" "$spec.podspec" \
+              || { echo "::error::$spec.podspec isn't at $TAG"; exit 1; }
+          done
+
+      # A pod already published at this version is skipped, so a run that failed halfway
+      # can be run again.
+      - name: Publish
+        env:
+          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
+        run: |
+          for spec in KiroraNotificationService Kirora; do
+            if curl -sf "https://trunk.cocoapods.org/api/v1/pods/$spec/specs/$TAG" > /dev/null; then
+              echo "$spec $TAG is already published"
+              continue
+            fi
+            pod trunk push "$spec.podspec" --allow-warnings --synchronous
+          done
