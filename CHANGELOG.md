@@ -1,6 +1,12 @@
 # Kirora iOS SDK
 
-## Unreleased
+## 0.1.0 (2026-11-23)
+
+First release: event tracking, sessions, screen views, app lifecycle events, tracking
+consent and push (registration, taps, app opens, and deliveries, images and buttons from
+a Notification Service Extension).
+
+### Changes during pre-release development
 
 - The event queue file is written at most once a second, and at once as the app goes to
   the background, rather than after every event: each write holds the whole queue (up to
@@ -210,9 +216,3 @@
     registration record, and the device id, are kept until Kirora confirms.
   - Clients in one app share one copy of each file, so two workspaces' clients no longer
     overwrite each other's saved state, and two clients never adopt the same events.
-
-## 0.1.0
-
-First release: event tracking, sessions, screen views, app lifecycle events, tracking
-consent and push (registration, taps, app opens, and deliveries and images from a
-Notification Service Extension).

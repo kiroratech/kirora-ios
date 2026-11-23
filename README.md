@@ -10,22 +10,24 @@ The SDK has an offline event queue, session tracking, separate consent controls 
 
 Swift 5.9; iOS 13+, Mac Catalyst 14+ and macOS 10.15+. Automatic lifecycle and push handling need UIKit.
 
-In Xcode, choose **File → Add Package Dependencies**, enter `https://github.com/kiroratech/kirora-ios`, choose a release tag and add:
+In Xcode, choose **File → Add Package Dependencies**, enter `https://github.com/kiroratech/kirora-ios`, choose **Up to Next Major Version** from `0.1.0` and add:
 
 | Product | Target | Purpose |
 | --- | --- | --- |
 | `Kirora` | Your app | Identity, events, sessions, consent and push |
 | `KiroraNotificationService` | Your Notification Service Extension | Delivery reports, images and buttons; independent of `Kirora` |
 
-With CocoaPods (until the pods are published, from a local checkout):
+In a `Package.swift`: `.package(url: "https://github.com/kiroratech/kirora-ios", from: "0.1.0")`.
+
+With CocoaPods:
 
 ```ruby
 target 'MyApp' do
-  pod 'Kirora', :path => '../kirora-ios'
+  pod 'Kirora', '~> 0.1'
 end
 
 target 'NotificationService' do
-  pod 'KiroraNotificationService', :path => '../kirora-ios'
+  pod 'KiroraNotificationService', '~> 0.1'
 end
 ```
 
