@@ -575,7 +575,7 @@ struct UnsupportedPushPlatform: PushPlatform {
     func authorization() async -> PushAuthorization { .notDetermined }
     func requestAuthorization() async throws -> Bool { false }
     func registerForRemoteNotifications() async {}
-    func firebaseToken() async -> String? { nil }
+    func firebaseTarget() async -> PushTarget? { nil }
 }
 
 /// The latest client's `handleDeepLink`. Taps reach the SDK through iOS, not a client, so

@@ -249,7 +249,7 @@ let status = await kirora.getPushStatus()             // .enabled, .disabled, .d
 
 The SDK hooks the APNs callbacks and notification taps automatically. It registers again when the user or token changes, or after a day, sending the app and OS versions, language and time zone.
 
-**Firebase:** if your push app uses FCM, install and configure FirebaseMessaging (with its APNs key) in your app. Kirora reads its token at runtime.
+**Firebase:** if your push app uses FCM, install and configure FirebaseMessaging (with its APNs key) in your app. Kirora reads its token at runtime. In Firebase's installation-ID mode (FirebaseMessaging 12.16 or later, with `FirebaseMessagingInstallationIdEnabled` set to `YES` in Info.plist), Kirora registers the device with Firebase and sends its installation ID instead.
 
 ### Device preference and marketing consent
 
@@ -414,7 +414,7 @@ Both products include a `PrivacyInfo.xcprivacy` manifest. Your App Store disclos
 | Events stay queued | `identify()`, the tracking choice, connectivity and the token endpoint. |
 | `401` or token error | The token secret, `sub`, expiry and your token request. Never log the token. |
 | No APNs token | Push capability, bundle ID and provisioning; callback forwarding if the proxy is off. |
-| No Firebase token | FirebaseMessaging, `FirebaseApp.configure()` and Firebase's APNs key. |
+| No Firebase token or installation ID | FirebaseMessaging, `FirebaseApp.configure()` and Firebase's APNs key. |
 | Permission granted but status disabled | Identify the user, `setPushEnabled(true)`, and check the logs for registration errors. |
 | No image or delivery report | The extension target and product; dashboard tests may carry no tracking. |
 | No action buttons | The extension; press and hold the notification; your app isn't calling `setNotificationCategories`. |

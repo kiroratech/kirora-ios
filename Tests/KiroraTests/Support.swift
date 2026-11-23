@@ -175,7 +175,12 @@ final class FakePushPlatform: PushPlatform, @unchecked Sendable {
     }
     /// Firebase's token, when the app includes Firebase.
     let fcmToken = Locked<String?>(nil)
-    func firebaseToken() async -> String? { fcmToken.current }
+    /// Firebase's installation id, when the app is in Firebase's installation-id mode.
+    let firebaseInstallationId = Locked<String?>(nil)
+    func firebaseTarget() async -> PushTarget? {
+        if let id = firebaseInstallationId.current { return PushTarget(kind: firebaseInstallationIdKind, token: id) }
+        return fcmToken.current.map { PushTarget(kind: fcmTokenKind, token: $0) }
+    }
     func registerForRemoteNotifications() async {
         registrations.withLock { $0 += 1 }
         if let token = apnsToken.current { tokens.received(token) }

@@ -314,6 +314,25 @@ struct PushRegistrationTests {
         #expect(await eventually { app.server.requests.filter { $0.method == "PUT" }.last?.body?["target"] == .string("fcm-token-2") })
     }
 
+    @Test func registersFirebasesInstallationIdInItsInstallationIdMode() async throws {
+        let app = TestApp()
+        app.server.answer(firebasePushApp)
+        app.push.firebaseInstallationId.withLock { $0 = "fid-1" }
+        try await app.start(push: .enabled).identify(userToken("user-1"))
+        let put = try #require(app.server.requests.first { $0.method == "PUT" })
+        #expect(put.body?["targetKind"] == .string("firebase_installation_id"))
+        #expect(put.body?["target"] == .string("fid-1"))
+        // The next start costs no push calls.
+        try await app.start(push: .enabled).identify(userToken("user-1"))
+        #expect(app.server.requests("GET", "/client/v1/push-app").count == 1)
+        #expect(app.server.requests.filter { $0.method == "PUT" }.count == 1)
+        // Leaving the mode registers Firebase's token instead.
+        app.push.firebaseInstallationId.withLock { $0 = nil }
+        app.push.fcmToken.withLock { $0 = "fcm-token-1" }
+        app.tokens.firebaseTokenChanged()
+        #expect(await eventually { app.server.requests.filter { $0.method == "PUT" }.last?.body?["targetKind"] == .string("fcm_token") })
+    }
+
     @Test func registersNothingForAFirebasePushAppWithoutFirebase() async throws {
         let app = TestApp()
         app.server.answer(firebasePushApp)

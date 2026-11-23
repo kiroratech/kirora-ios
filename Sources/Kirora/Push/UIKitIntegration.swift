@@ -181,43 +181,99 @@ struct UIKitPushPlatform: PushPlatform {
         }
     }
 
-    func firebaseToken() async -> String? {
-        await FirebaseMessagingBridge.token()
+    func firebaseTarget() async -> PushTarget? {
+        await FirebaseMessagingBridge.target()
     }
 }
 
-/// Reads Firebase's registration token from FirebaseMessaging when the app includes it,
-/// through the Objective-C runtime, so the SDK never links Firebase itself.
+/// Reads what Firebase registers the device as from FirebaseMessaging when the app includes
+/// it, through the Objective-C runtime, so the SDK never links Firebase itself.
 enum FirebaseMessagingBridge {
-    /// Posted by FirebaseMessaging when its token changes
-    /// (`FIRMessagingRegistrationTokenRefreshedNotification`).
-    static let tokenRefreshed = Notification.Name("com.firebase.iid.notif.fcm-token")
+    /// Posted by FirebaseMessaging when its token, or in installation-id mode its
+    /// registration, is made or changes (`FIRMessagingRegistrationTokenRefreshedNotification`).
+    static let tokenRefreshed = Notification.Name("com.firebase.messaging.notif.fcm-token-refreshed")
 
-    private static var messaging: NSObject? {
-        let selector = NSSelectorFromString("messaging")
-        guard let messagingClass = NSClassFromString("FIRMessaging") as? NSObject.Type,
-              messagingClass.responds(to: selector) else { return nil }
-        return messagingClass.perform(selector)?.takeUnretainedValue() as? NSObject
+    /// How long to wait for each Firebase answer.
+    private static let wait: Double = 10
+
+    /// The token, or the installation id in installation-id mode.
+    @MainActor
+    static func target() async -> PushTarget? {
+        guard let messaging = shared("FIRMessaging", "messaging") else { return nil }
+        guard installationIdEnabled(messaging) else {
+            if let token = messaging.value(forKey: "FCMToken") as? String, !token.isEmpty {
+                return PushTarget(kind: fcmTokenKind, token: token)
+            }
+            return await string(from: messaging, "tokenWithCompletion:").map { PushTarget(kind: fcmTokenKind, token: $0) }
+        }
+        guard await registered(messaging), let installations = shared("FIRInstallations", "installations") else { return nil }
+        return await string(from: installations, "installationIDWithCompletion:")
+            .map { PushTarget(kind: firebaseInstallationIdKind, token: $0) }
     }
 
-
-    /// The token, waiting up to 10 seconds for Firebase to make one.
+    /// Firebase's installation-id mode (FirebaseMessaging 12.16 and later, with
+    /// `FirebaseMessagingInstallationIdEnabled` in the app's Info.plist): Firebase makes no
+    /// token, and the device registers with FCM as its Firebase installation id.
     @MainActor
-    static func token() async -> String? {
-        guard let messaging else { return nil }
-        if let token = messaging.value(forKey: "FCMToken") as? String, !token.isEmpty { return token }
-        let selector = NSSelectorFromString("tokenWithCompletion:")
-        guard messaging.responds(to: selector) else { return nil }
-        // FirebaseMessaging is thread-safe; it's only handed over to be called back.
+    private static func installationIdEnabled(_ messaging: NSObject) -> Bool {
+        messaging.responds(to: NSSelectorFromString("isInstallationIdEnabled"))
+            && (messaging.value(forKey: "installationIdEnabled") as? Bool) == true
+    }
+
+    /// The registration below, shared by every read until it fails.
+    private static let registration = Locked<Task<Bool, Never>?>(nil)
+
+    /// Whether Firebase registered the installation id with FCM, which reading the id
+    /// doesn't (an app with Firebase's auto-init off relies on this). Asked once a run, and
+    /// again after a failure, not on every read: Firebase answers each request by posting
+    /// `tokenRefreshed`, which reads again.
+    @MainActor
+    private static func registered(_ messaging: NSObject) async -> Bool {
+        let register = NSSelectorFromString("registerWithCompletion:")
+        guard messaging.responds(to: register) else { return false }
         let shared = UncheckedSendable(messaging)
-        return try? await withTimeout(seconds: 10) {
+        let task = registration.withLock { task in
+            if let task { return task }
+            let started = Task { @MainActor () -> Bool in
+                let done = (try? await withTimeout(seconds: wait) {
+                    await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                        let completion: @convention(block) (NSError?) -> Void = { continuation.resume(returning: $0 == nil) }
+                        _ = shared.value.perform(register, with: completion)
+                    }
+                }) ?? false
+                if !done { registration.withLock { $0 = nil } }
+                return done
+            }
+            task = started
+            return started
+        }
+        return await task.value
+    }
+
+    /// A Firebase object reached through a class method, such as `FIRMessaging.messaging`.
+    private static func shared(_ className: String, _ selectorName: String) -> NSObject? {
+        let selector = NSSelectorFromString(selectorName)
+        guard let type = NSClassFromString(className) as? NSObject.Type, type.responds(to: selector) else { return nil }
+        return type.perform(selector)?.takeUnretainedValue() as? NSObject
+    }
+
+    /// The string a Firebase method gives its `(NSString?, NSError?)` completion; nil for an
+    /// error, an empty string or no answer in time.
+    @MainActor
+    private static func string(from object: NSObject, _ selectorName: String) async -> String? {
+        let selector = NSSelectorFromString(selectorName)
+        guard object.responds(to: selector) else { return nil }
+        // Firebase's objects are thread-safe; they're only handed over to be called back.
+        let shared = UncheckedSendable(object)
+        let value = try? await withTimeout(seconds: wait) {
             await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
-                let completion: @convention(block) (NSString?, NSError?) -> Void = { token, _ in
-                    continuation.resume(returning: token as String?)
+                let completion: @convention(block) (NSString?, NSError?) -> Void = { value, _ in
+                    continuation.resume(returning: value as String?)
                 }
                 _ = shared.value.perform(selector, with: completion)
             }
         }
+        return value.flatMap { $0.isEmpty ? nil : $0 }
     }
 }
 

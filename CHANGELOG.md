@@ -8,6 +8,13 @@
 - Push: when the SDK adds the APNs token callbacks to an app delegate that lacks them,
   it sets the delegate again, so UIKit sees them (as Firebase does). Before, such an app
   could get no token and never register.
+- Push: an app in Firebase's installation-ID mode (FirebaseMessaging 12.16+,
+  `FirebaseMessagingInstallationIdEnabled` = `YES`), which has no FCM token, registers its
+  Firebase installation ID (`targetKind: "firebase_installation_id"`). Before, it never
+  registered.
+- Fix: a new Firebase token registers the device again at once. The SDK listened for a
+  notification name Firebase no longer posts, so a token Firebase changed while the app
+  ran went unregistered until the next launch.
 - The background flush writes the client's event file without holding a thread, and no longer waits on every Kirora file in the process.
 - Fix: during `logout()`, a sign-in already under way adopted events tracked during the
   logout, an `identify()` made during it adopted the outgoing user's waiting events, and

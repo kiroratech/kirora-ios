@@ -16,9 +16,17 @@ protocol PushPlatform: Sendable {
     func requestAuthorization() async throws -> Bool
     /// Asks iOS for the APNs token, which arrives through ``PushTokens``.
     func registerForRemoteNotifications() async
-    /// Firebase's registration token, for a push app that sends through Firebase. Nil when
-    /// the app doesn't include FirebaseMessaging, or it has no token yet.
-    func firebaseToken() async -> String?
+    /// What Firebase registers this device as, for a push app that sends through Firebase:
+    /// its registration token, or its installation id when the app is in Firebase's
+    /// installation-id mode. Nil when the app doesn't include FirebaseMessaging, or Firebase
+    /// has neither yet.
+    func firebaseTarget() async -> PushTarget?
+}
+
+/// What a device registers as for push: a token or id, and its kind (`targetKind`).
+struct PushTarget: Equatable, Sendable {
+    var kind: String
+    var token: String
 }
 
 /// The APNs device token, as iOS hands it to the app delegate. Process-wide, since iOS
@@ -98,7 +106,8 @@ struct PushRegistrationRecord: Codable, Equatable {
     var userSubject: String
     var config: String
     var token: String
-    /// `apns_token` or `fcm_token`, as Kirora said for the push app.
+    /// `apns_token` or `fcm_token`, as Kirora said for the push app, or
+    /// `firebase_installation_id` for an `fcm_token` app in Firebase's installation-id mode.
     var targetKind: String
     var pushAppId: String
     /// `granted`, or `denied` once a revoked permission was reported.
@@ -131,6 +140,7 @@ struct PushRegistrationRecord: Codable, Equatable {
 private let registrationRefresh: Double = 24 * 60 * 60
 let apnsTokenKind = "apns_token"
 let fcmTokenKind = "fcm_token"
+let firebaseInstallationIdKind = "firebase_installation_id"
 
 /// How long to wait for iOS to give the APNs token.
 private let tokenWait: Double = 10
@@ -590,12 +600,13 @@ final class PushRegistrar: @unchecked Sendable {
         // A signed-in start costs no push calls: the kind of token comes from the last
         // registration while it's fresh, and from Kirora otherwise.
         if let record, isFresh(record, user: user, config: config) {
-            if await self.token(of: record.targetKind, apnsToken: apnsToken) == record.token || !current() { return }
+            let target = await self.target(for: record.targetKind, apnsToken: apnsToken)
+            if target == PushTarget(kind: record.targetKind, token: record.token) || !current() { return }
         }
         guard current(), let pushApp = try await choosePushApp(as: user), current() else { return }
-        guard let token = await self.token(of: pushApp.targetKind, apnsToken: apnsToken) else {
+        guard let target = await self.target(for: pushApp.targetKind, apnsToken: apnsToken) else {
             log.error(pushApp.targetKind == fcmTokenKind
-                ? "This push app sends through Firebase, but the app has no Firebase token. Add FirebaseMessaging and configure Firebase"
+                ? "This push app sends through Firebase, but Firebase gave no token or installation id. Add FirebaseMessaging and configure Firebase"
                 : "iOS gave no APNs token. Is the Push Notifications capability on?")
             return
         }
@@ -603,14 +614,14 @@ final class PushRegistrar: @unchecked Sendable {
         var body = deviceInfo.registrationDetails()
         body["deviceSecret"] = .string(deviceSecret)
         body["pushAppId"] = .string(pushApp.pushAppId)
-        body["targetKind"] = .string(pushApp.targetKind)
+        body["targetKind"] = .string(target.kind)
         body["permission"] = .string("granted")
-        body["target"] = .string(token)
+        body["target"] = .string(target.token)
         let answer = try await api.request("PUT", "/devices/\(installationId)", body: JSONValue.object(body), as: user)
         // Saved even if the user changed meanwhile: it records who Kirora now has, so the
         // next user's registration (queued behind this one) isn't skipped as fresh.
         save(PushRegistrationRecord(
-            userSubject: user.subject, config: config, token: token, targetKind: pushApp.targetKind,
+            userSubject: user.subject, config: config, token: target.token, targetKind: target.kind,
             pushAppId: pushApp.pushAppId, permission: "granted",
             lastSeenAt: answer?["lastSeenAt"]?.stringValue, at: epochMs(now()), installationId: installationId,
             deviceSecret: deviceSecret
@@ -618,9 +629,9 @@ final class PushRegistrar: @unchecked Sendable {
         log.debug("Registered this device for push")
     }
 
-    /// The token of the kind Kirora asked for.
-    private func token(of kind: String, apnsToken: String?) async -> String? {
-        kind == fcmTokenKind ? await platform.firebaseToken() : apnsToken
+    /// What to register as for a push app taking `kind`: the APNs token, or Firebase's.
+    private func target(for kind: String, apnsToken: String?) async -> PushTarget? {
+        kind == apnsTokenKind ? apnsToken.map { PushTarget(kind: apnsTokenKind, token: $0) } : await platform.firebaseTarget()
     }
 
     /// Notifications are off: tell Kirora, so it stops sending, naming the registration it
