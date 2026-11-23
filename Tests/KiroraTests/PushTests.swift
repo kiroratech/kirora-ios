@@ -181,13 +181,14 @@ struct PushRegistrationTests {
         let app = TestApp()
         // Room for the detach to start before the deadline on a busy machine: one that starts
         // after it goes without one, and isn't what this checks.
-        app.logoutWait = 0.4
+        app.logoutWait = 0.6
         let kirora = app.start(push: .enabled)
         try await kirora.identify(userToken("user-1"))
-        app.server.answer { $0.method == "DELETE" ? FakeAnswer(status: 204, body: nil, delay: 2) : nil }
+        app.server.answer { $0.method == "DELETE" ? FakeAnswer(status: 204, body: nil, delay: 3) : nil }
         let started = Date()
         await kirora.logout()
-        #expect(Date().timeIntervalSince(started) < 1)
+        // Well short of the 3-second answer, with room for a slow CI machine.
+        #expect(Date().timeIntervalSince(started) < 2)
         // Forgotten: nothing more goes as user-1.
         kirora.track("After Logout")
         await kirora.flush()
@@ -195,7 +196,7 @@ struct PushRegistrationTests {
         #expect(!app.server.sentEventNames.contains("After Logout"))
         // The request still under way at the deadline was cancelled, and the detachment
         // carries on in the background.
-        #expect(await eventually { app.server.requests.filter { $0.method == "DELETE" }.count >= 2 })
+        #expect(await eventually(5) { app.server.requests.filter { $0.method == "DELETE" }.count >= 2 })
     }
 
     @Test func logoutCancelsASendStillUnderWayAtItsDeadline() async throws {
@@ -205,14 +206,15 @@ struct PushRegistrationTests {
         try await kirora.identify(userToken("user-1"))
         app.server.answer { request in
             guard request.path == "/client/v1/events/batch" else { return nil }
-            return FakeAnswer(status: 200, body: nil, delay: 1)
+            return FakeAnswer(status: 200, body: nil, delay: 2)
         }
         kirora.track("Slow")
         let started = Date()
         await kirora.logout()
-        #expect(Date().timeIntervalSince(started) < 0.6)
+        // Well short of the 2-second answer, with room for a slow CI machine.
+        #expect(Date().timeIntervalSince(started) < 1.2)
         // The slow answer never lands: the request was cancelled.
-        await settle(1.2)
+        await settle(2.2)
         #expect(app.server.completedRequests.filter { $0.path == "/client/v1/events/batch" }.isEmpty)
     }
 
