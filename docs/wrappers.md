@@ -7,33 +7,45 @@ the omnichannel repo.
 
 ## Linking
 
-React Native links native iOS code through CocoaPods; Flutter through CocoaPods or Swift
-Package Manager, whichever the app uses, so a Flutter plugin ships both. In the wrapper's
-podspec:
+The SDK isn't on the CocoaPods trunk, which becomes read-only on 2 December 2026, so a
+wrapper can't depend on a `Kirora` pod. Instead:
 
-```ruby
-s.dependency 'Kirora', '~> 0.1'
-```
+- **CocoaPods (React Native; Flutter by default): bundle the SDK.** Copy `Sources/Kirora/`
+  from a release tag into the wrapper's package, and compile it in the wrapper's own podspec
+  with the bridge, taking `Kirora.podspec`'s `source_files`, `resource_bundles` and
+  `frameworks` with the copy's path in front:
 
-and in a Flutter plugin's `ios/<plugin>/Package.swift`, beside Flutter's own
-`FlutterFramework` dependency:
+  ```ruby
+  s.source_files = 'ios/**/*.swift', 'ios/vendor/kirora-ios/Sources/Kirora/**/*.swift'
+  ```
 
-```swift
-.package(url: "https://github.com/kiroratech/kirora-ios.git", from: "0.1.0"),
-// in the target: .product(name: "Kirora", package: "kirora-ios")
-```
+  The bridge is then in the same module as the SDK: it needs no `import Kirora`, and sees
+  the `@_spi(Wrapper)` API without one. An app using the wrapper must not also add the
+  `Kirora` pod. Keep a script that refreshes the copy from a given tag, and say in the
+  wrapper's release notes which tag it carries.
+- **Swift Package Manager (Flutter's option): depend on this repo.** In the plugin's
+  `ios/<plugin>/Package.swift`, beside Flutter's own `FlutterFramework` dependency:
 
-Swift Package Manager resolves versions from this repo's git tags, so a release must be
-tagged before a wrapper's manifest can use it. Name a version range, and say in the wrapper's
-release notes which native versions it was tested with. The app's Notification Service
-Extension adds `KiroraNotificationService` itself (see the README's "Delivery reports and
+  ```swift
+  .package(url: "https://github.com/kiroratech/kirora-ios.git", from: "0.1.0"),
+  // in the target: .product(name: "Kirora", package: "kirora-ios")
+  ```
+
+  It resolves versions from this repo's git tags, so a release must be tagged first. The
+  native module imports the wrapper surface, which is Swift SPI:
+
+  ```swift
+  @_spi(Wrapper) import Kirora
+  ```
+
+  A plugin that ships both keeps the import behind a flag its podspec sets for the bundled
+  build (`s.pod_target_xcconfig = { 'SWIFT_ACTIVE_COMPILATION_CONDITIONS' => '$(inherited)
+  KIRORA_BUNDLED' }`, then `#if !KIRORA_BUNDLED`), not `canImport(Kirora)`, which an app's
+  own `Kirora` pod would make true.
+
+The app's Notification Service Extension adds `KiroraNotificationService` itself, from Swift
+Package Manager or a Podfile `:git`/`:tag` line (see the README's "Delivery reports and
 images").
-
-The wrapper surface is Swift SPI. The wrapper's native module, written in Swift, imports it:
-
-```swift
-@_spi(Wrapper) import Kirora
-```
 
 ## At launch
 

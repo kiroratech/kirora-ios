@@ -1,5 +1,5 @@
 # Builds and tests the SDK on every push to main and every pull request. Nothing here
-# tags, releases or publishes: that stays a manual step until the SDK is released.
+# tags or releases: tagging a release is manual (see AGENTS.md).
 name: CI
 
 on:

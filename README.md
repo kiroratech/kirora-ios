@@ -19,19 +19,19 @@ In Xcode, choose **File → Add Package Dependencies**, enter `https://github.co
 
 In a `Package.swift`: `.package(url: "https://github.com/kiroratech/kirora-ios", from: "0.1.0")`.
 
-With CocoaPods:
+With CocoaPods, from the release tag (the SDK isn't on the CocoaPods trunk):
 
 ```ruby
 target 'MyApp' do
-  pod 'Kirora', '~> 0.1'
+  pod 'Kirora', :git => 'https://github.com/kiroratech/kirora-ios.git', :tag => '0.1.0'
 end
 
 target 'NotificationService' do
-  pod 'KiroraNotificationService', '~> 0.1'
+  pod 'KiroraNotificationService', :git => 'https://github.com/kiroratech/kirora-ios.git', :tag => '0.1.0'
 end
 ```
 
-For React Native or Flutter, use the Kirora wrapper SDK. Bridge maintainers: see [Wrapper SDKs](docs/wrappers.md).
+For Flutter, use [`kirora_flutter`](https://pub.dev/packages/kirora_flutter) (`flutter pub add kirora_flutter`); for React Native, the Kirora React Native SDK. Each bundles this SDK. Bridge maintainers: see [Wrapper SDKs](docs/wrappers.md).
 
 ## Quickstart
 

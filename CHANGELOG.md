@@ -137,7 +137,8 @@ a Notification Service Extension).
 - `onAuthenticationFailed`: called on the main thread with `.fetchFailed` or `.refused`
   when the user's token fails in the background, where no method would throw it; not for
   work `identify()` started that fails as `identify()` itself throws.
-- CocoaPods: `Kirora` and `KiroraNotificationService` pods, beside Swift Package Manager.
+- CocoaPods: `Kirora` and `KiroraNotificationService` pods from the release tag
+  (`:git`/`:tag`; not on trunk), beside Swift Package Manager.
 - For the React Native and Flutter SDKs, which wrap this one (`@_spi(Wrapper)`, not for
   apps): their own `Kirora-SDK` name, `fetchUserToken` answered across the bridge, a tap
   listener that holds the latest ten taps until it's attached, and `handleDeepLink` and

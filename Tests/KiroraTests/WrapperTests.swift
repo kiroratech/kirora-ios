@@ -314,4 +314,17 @@ struct DistributionTests {
             #expect(spec.contains("s.version          = '\(sdkVersion)'"), "\(name)")
         }
     }
+
+    /// The wrapper SDKs compile a copy of `Sources/Kirora` into one module, which can't
+    /// hold two files of the same name.
+    @Test func sourceFileNamesAreUnique() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let sources = root.appendingPathComponent("Sources/Kirora")
+        let names = try #require(FileManager.default.enumerator(atPath: sources.path))
+            .compactMap { $0 as? String }
+            .filter { $0.hasSuffix(".swift") }
+            .map { ($0 as NSString).lastPathComponent }
+        #expect(!names.isEmpty)
+        #expect(Set(names).count == names.count, "\(Dictionary(grouping: names, by: { $0 }).filter { $0.value.count > 1 }.keys.sorted())")
+    }
 }
